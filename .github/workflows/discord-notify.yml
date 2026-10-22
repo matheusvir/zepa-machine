@@ -1,0 +1,322 @@
+name: Discord notifications
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, review_requested, closed]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [labeled, unlabeled]
+  workflow_dispatch:
+
+permissions:
+  issues: read
+  pull-requests: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DISCORD_UPDATES_WEBHOOK_URL: ${{ secrets.DISCORD_UPDATES_WEBHOOK_URL }}
+      DISCORD_ALERTS_WEBHOOK_URL: ${{ secrets.DISCORD_ALERTS_WEBHOOK_URL }}
+      DISCORD_USER_MAP: ${{ vars.DISCORD_USER_MAP }}
+      DISCORD_FRONT_LEADS: ${{ vars.DISCORD_FRONT_LEADS }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_ACTION: ${{ github.event.action }}
+      ACTOR: ${{ github.actor }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Route event to Discord
+        # Notifications only: never check out or execute PR/fork code.
+        # Fork pull_request_review events have only read-only GITHUB_TOKEN, no webhook secrets.
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          API = "https://api.github.com"
+          FRONT_LOGINS = {"front-1": "arthurlazevedo", "front-2": "RailtonDantas", "front-3": "matheusvir"}
+          USER_AGENT = "zesh-discord-notifications"
+
+          class ApiRedirectHandler(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, new_url):
+                  target = urllib.parse.urlsplit(new_url)
+                  if target.scheme == "https" and target.netloc.casefold() == "api.github.com":
+                      return super().redirect_request(request, fp, code, message, headers, new_url)
+                  return None
+
+          def clean(value):
+              return re.sub(r"@", "@\u200b", str(value or "")).replace("\r", " ").replace("\n", " ")[:250]
+
+          def json_map(name):
+              try:
+                  value = json.loads(os.environ.get(name, "") or "{}")
+                  return value if isinstance(value, dict) else {}
+              except (TypeError, ValueError):
+                  return {}
+
+          def discord_id(login):
+              mapping = json_map("DISCORD_USER_MAP")
+              value = next((v for k, v in mapping.items() if str(k).casefold() == str(login).casefold()), "")
+              value = str(value)
+              return value if re.fullmatch(r"\d{17,20}", value) else None
+
+          def mention(login):
+              user_id = discord_id(login)
+              return (f"<@{user_id}>", user_id) if user_id else ("", None)
+
+          def front_lead(labels):
+              fronts = {str(label.get("name", "")).casefold() for label in labels if isinstance(label, dict)}
+              fronts = fronts.intersection(FRONT_LOGINS)
+              if len(fronts) != 1:
+                  return None
+              front = next(iter(fronts))
+              configured_text = os.environ.get("DISCORD_FRONT_LEADS", "").strip()
+              configured = json_map("DISCORD_FRONT_LEADS")
+              if configured_text:
+                  login = next((v for k, v in configured.items() if str(k).casefold() == front), None)
+              else:
+                  login = FRONT_LOGINS[front]
+              if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9-]+", login):
+                  return None
+              text, user_id = mention(login)
+              return (text, user_id, front) if user_id else None
+
+          def task_section(body):
+              lines = (body or "").splitlines()
+              for i, line in enumerate(lines):
+                  heading = re.match(r"^(#{1,6})\s*Task reference\s*#*\s*$", line.strip(), re.I)
+                  if not heading:
+                      continue
+                  level = len(heading.group(1))
+                  end = len(lines)
+                  for j in range(i + 1, len(lines)):
+                      next_heading = re.match(r"^(#{1,6})\s+", lines[j].strip())
+                      if next_heading and len(next_heading.group(1)) <= level:
+                          end = j
+                          break
+                  return "\n".join(lines[i + 1:end]), True
+              return body or "", False
+
+          def task_refs(body, current_repo):
+              section, has_section = task_section(body)
+              refs = set()
+              if not has_section:
+                  return refs, False
+              # Accept only explicit issue references; subtasks and Evidence are never scanned.
+              task_repo = current_repo.lower()
+              if task_repo == "matheusvir/zepa-machine":
+                  task_repo = "matheusvir/zesh"
+              for match in re.finditer(r"(?i)\b(?:issue|refs?|closes?)\s+#(\d+)\b", section):
+                  number = int(match.group(1))
+                  refs.add((task_repo, number))
+              for match in re.finditer(r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)\b", section, re.I):
+                  refs.add((match.group(1).lower(), int(match.group(2))))
+              return refs, has_section
+
+          def issue_get(repo, number):
+              allowed = {os.environ.get("REPOSITORY", "").lower(), "matheusvir/zesh"}
+              if repo.lower() not in allowed or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                  return None
+              path = "/repos/" + "/".join(urllib.parse.quote(part, safe="") for part in repo.split("/")) + f"/issues/{int(number)}"
+              token = os.environ.get("GITHUB_TOKEN", "")
+              for credential in (token, "") if token else ("",):
+                  headers = {
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28", "User-Agent": USER_AGENT,
+                  }
+                  if credential:
+                      headers["Authorization"] = "Bearer " + credential
+                  request = urllib.request.Request(API + path, headers=headers)
+                  try:
+                      with urllib.request.build_opener(ApiRedirectHandler).open(request, timeout=8) as response:
+                          result = json.loads(response.read().decode("utf-8"))
+                      if result.get("pull_request") or int(result.get("number", -1)) != int(number):
+                          return None
+                      return result
+                  except urllib.error.HTTPError as error:
+                      if credential and error.code in (401, 403, 404):
+                          continue  # Public cross-repo issue: retry once without credentials.
+                      return None
+                  except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError):
+                      return None
+              return None
+
+          def resolve_issue(pr, current_repo):
+              refs, _ = task_refs(pr.get("body", ""), current_repo)
+              if len({number for _, number in refs}) > 1:
+                  return None, "Ambiguous task references; no issue was selected and no user was pinged."
+              if refs:
+                  matches = [(repo, issue) for repo, number in sorted(refs) if (issue := issue_get(repo, number))]
+                  if len(matches) == 1:
+                      return matches[0], None
+                  if len(matches) > 1:
+                      return None, "The reference matches issues in multiple repositories; no user was pinged."
+                  return None, "The referenced item could not be verified as an issue; no user was pinged."
+              # Body has no explicit ref: accept a branch number only when PR and issue task codes match.
+              branch = pr.get("head", {}).get("ref", "")
+              branch_match = re.search(r"(?:^|/)[a-z]+/((?:f[123]-\d+|int-\d+))-[a-z0-9-]+-(\d+)$", branch, re.I)
+              pr_codes = [code.casefold() for code in re.findall(r"(?<![A-Za-z0-9])((?:F[123]|INT)-\d+)\b", pr.get("title", ""), re.I)]
+              if branch_match and len(pr_codes) == 1 and branch_match.group(1).casefold() == pr_codes[0]:
+                  number = int(branch_match.group(2))
+                  matches = []
+                  for repo in dict.fromkeys((current_repo, "matheusvir/zesh")):
+                      issue = issue_get(repo, number)
+                      issue_codes = [code.casefold() for code in re.findall(r"(?<![A-Za-z0-9])((?:F[123]|INT)-\d+)\b", issue.get("title", ""), re.I)] if issue else []
+                      if len(issue_codes) == 1 and issue_codes[0] == pr_codes[0]:
+                          matches.append((repo.lower(), issue))
+                  if len(matches) == 1:
+                      return matches[0], None
+                  if len(matches) > 1:
+                      return None, "The branch fallback matches multiple issues; no user was pinged."
+              return None, "No unambiguous task issue found; no user was pinged."
+
+          def reviewer_login(issue, author):
+              # The Planning section precedes Description; inspect only its table row.
+              lines = (issue.get("body") or "").splitlines()
+              in_planning = False
+              section_level = None
+              planning_lines = []
+              for line in lines:
+                  heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line.strip())
+                  if heading:
+                      level = len(heading.group(1))
+                      if in_planning and level <= section_level:
+                          break
+                      if heading.group(2).casefold() == "planning":
+                          in_planning, section_level = True, level
+                          continue
+                  if in_planning:
+                      planning_lines.append(line)
+              rows = [re.match(r"^\s*\|\s*Reviewer\s*\|\s*(.*?)\s*\|\s*$", line, re.I) for line in planning_lines]
+              rows = [row.group(1) for row in rows if row]
+              if not rows:
+                  return None, "the issue has no Reviewer row in Planning"
+              if len(rows) != 1:
+                  return None, "Planning does not have exactly one Reviewer row"
+              logins = re.findall(r"(?<![\w])@([A-Za-z0-9-]+)\b", rows[0])
+              if len(logins) != 1:
+                  return None, "the Reviewer row must contain exactly one @login"
+              login = logins[0]
+              if login.casefold() == str(author or "").casefold():
+                  return None, "the planned reviewer is the PR author"
+              if not discord_id(login):
+                  return None, "the planned reviewer has no Discord ID mapping"
+              return login, None
+
+          def post(channel, text, user_ids):
+              webhook = os.environ.get("DISCORD_UPDATES_WEBHOOK_URL" if channel == "updates" else "DISCORD_ALERTS_WEBHOOK_URL", "")
+              if not webhook:
+                  print(f"Missing Discord webhook secret for {channel}; message not sent.", file=sys.stderr)
+                  return False
+              # Only explicitly mapped IDs can ping; user-controlled text has @ escaped above.
+              content = text[:2000]
+              data = json.dumps({"content": content, "allowed_mentions": {"parse": [], "users": sorted(set(user_ids))}}).encode("utf-8")
+              try:
+                  request = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}, method="POST")
+                  with urllib.request.urlopen(request, timeout=8) as response:
+                      if 200 <= response.status < 300:
+                          return True
+                      print(f"Discord returned HTTP {response.status}; message not sent.", file=sys.stderr)
+              except urllib.error.HTTPError as error:
+                  print(f"Discord returned HTTP {error.code}; message not sent.", file=sys.stderr)
+              except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError):
+                  print("Discord request failed or timed out; message not sent.", file=sys.stderr)
+              return False
+
+          def main():
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                  event = json.load(event_file)
+              name, action = os.environ.get("EVENT_NAME", ""), os.environ.get("EVENT_ACTION", "")
+              actor = clean(os.environ.get("ACTOR", "unknown"))
+              repo = os.environ.get("REPOSITORY", "")
+              notifications = []
+              if name == "workflow_dispatch":
+                  notifications = [("updates", f"Manual test — {clean(repo)} by {actor}.", []), ("alerts", f"Manual alert test — {clean(repo)} by {actor}.", [])]
+              elif name in ("pull_request_target", "pull_request_review"):
+                  pr = event.get("pull_request") or {}
+                  title, pr_url = clean(pr.get("title") or "(untitled)"), pr.get("html_url", "")
+                  number, author = pr.get("number", event.get("number", "?")), (pr.get("user") or {}).get("login", "")
+                  task, warning = resolve_issue(pr, repo)
+                  issue_repo, issue = task if task else (repo, None)
+                  issue_url = f"https://github.com/{issue_repo}/issues/{issue['number']}" if issue else ""
+                  reviewer, reviewer_problem = reviewer_login(issue, author) if issue else (None, warning)
+                  planned = bool(reviewer)
+                  if name == "pull_request_target" and action == "review_requested":
+                      pass  # GitHub already delivered the request; avoid duplicate pings.
+                  elif name == "pull_request_target" and action in ("opened", "reopened", "ready_for_review"):
+                      if not pr.get("draft"):
+                          ping, user_id = mention(reviewer) if planned else ("", None)
+                          text = f"PR #{number} {title} is ready for review (event by {actor}): {pr_url}."
+                          if issue_url:
+                              text += f" Task issue: {issue_url}."
+                          if ping:
+                              text += f" Planned reviewer: {ping}."
+                          elif reviewer_problem:
+                              text += f" No reviewer ping: {reviewer_problem}."
+                          notifications.append(("updates", text, [user_id] if user_id else []))
+                  elif name == "pull_request_review" and action == "submitted":
+                      review = event.get("review") or {}
+                      state, reviewer_actor = str(review.get("state", "")).casefold(), (review.get("user") or {}).get("login", "")
+                      if state in ("approved", "changes_requested"):
+                          valid_reviewer = planned and reviewer_actor.casefold() == reviewer.casefold() and reviewer_actor.casefold() != author.casefold()
+                          if state == "changes_requested":
+                              ping_text, ping_id = mention(author)
+                              who = clean(reviewer_actor) if valid_reviewer else f"Reviewer {clean(reviewer_actor)}"
+                              text = f"{who} requested changes on PR #{number} {title}. The author should address them: {pr_url}."
+                              if ping_text:
+                                  text += f" {ping_text}"
+                              notifications.append(("updates", text, [ping_id] if ping_id else []))
+                          else:
+                              text = f"PR #{number} {title} was approved by {clean(reviewer_actor)}. Approval is not validation: rerun acceptance criteria and move the issue to Validated before merge."
+                              ids = []
+                              if valid_reviewer and issue:
+                                  labels = issue.get("labels", [])
+                                  lead = front_lead(labels)
+                                  bump = bool(re.search(r"(?i)(?:bump|pin).*zepa-machine|zepa-machine.*(?:bump|pin)", title))
+                                  if bump:
+                                      text += " Global lead must merge the submodule pin; no global-lead mention is configured."
+                                  elif lead:
+                                      text += f" Front lead {lead[0]} may merge only after validation."
+                                      ids.append(lead[1])
+                                  else:
+                                      text += " No unique mapped front lead; no lead was pinged."
+                              elif not valid_reviewer:
+                                  if reviewer_problem:
+                                      text += f" No lead ping: {reviewer_problem}."
+                                  else:
+                                      text += " This approval was not by the planned reviewer; no lead was pinged."
+                              notifications.append(("updates", text + f" {pr_url}", ids))
+                  elif name == "pull_request_target" and action == "closed":
+                      if pr.get("merged"):
+                          text = f"{actor} merged PR #{number} {title}: {pr_url}. Issue status is unchanged here."
+                      else:
+                          text = f"{actor} closed PR #{number} {title} without merging: {pr_url}. Return its issue to In Progress manually."
+                      notifications.append(("updates", text, []))
+              elif name == "issues" and action in ("labeled", "unlabeled"):
+                  issue, label = event.get("issue") or {}, (event.get("label") or {}).get("name", "")
+                  if label.casefold() == "blocked":
+                      url = issue.get("html_url", "")
+                      if action == "labeled":
+                          lead = front_lead(issue.get("labels", []))
+                          ping, user_id = (lead[0], lead[1]) if lead else ("", None)
+                          text = f"{actor} added the blocked label to issue #{issue.get('number', '?')} {clean(issue.get('title'))}: {url}."
+                          text += f" Front lead {ping} notified." if ping else " No unique mapped front lead; no one was pinged."
+                          notifications.append(("alerts", text, [user_id] if user_id else []))
+                      else:
+                          notifications.append(("alerts", f"{actor} removed the blocked label from issue #{issue.get('number', '?')} {clean(issue.get('title'))}: {url}.", []))
+              ok = True
+              for channel, text, ids in notifications:
+                  ok = post(channel, text, ids) and ok
+              if not ok:
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
