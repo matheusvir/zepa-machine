@@ -116,7 +116,20 @@ jobs:
               for match in re.finditer(r"(?i)\b(?:issue|refs?|closes?)\s+#(\d+)\b", section):
                   number = int(match.group(1))
                   refs.add((task_repo, number))
-              for match in re.finditer(r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)\b", section, re.I):
+              url_matches = list(re.finditer(r"https?://[^\s<>()]+", section, re.I))
+              url_spans = [match.span() for match in url_matches]
+              for match in url_matches:
+                  parsed = urllib.parse.urlsplit(match.group(0).rstrip(".,;:!?"))
+                  if parsed.scheme.casefold() != "https" or parsed.netloc.casefold() != "github.com":
+                      continue
+                  issue_url = re.fullmatch(r"/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)/?", parsed.path, re.I)
+                  if issue_url:
+                      refs.add((issue_url.group(1).lower(), int(issue_url.group(2))))
+              # GitHub's owner/repo#N shorthand is accepted only as a standalone token,
+              # never by extracting a path suffix from an arbitrary URL.
+              for match in re.finditer(r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b", section):
+                  if any(start <= match.start() < end for start, end in url_spans):
+                      continue
                   refs.add((match.group(1).lower(), int(match.group(2))))
               return refs, has_section
 
