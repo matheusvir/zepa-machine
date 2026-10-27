@@ -72,53 +72,111 @@ pure bounds/consistency check is declared for consumers; it does not assemble
 or store images.
 
 The load owner copies all bytes and initializes descriptor metadata before
-publishing its nonzero valid token last. Readers consume only a descriptor
-whose valid token is nonzero and differs from the descriptor ack token. A
-designated descriptor reader explicitly acks the PublicationToken after
-consuming the metadata. Descriptor ack means only “metadata consumed”; it
-does not permit image replacement. Logical validity is distinct from byte
-lifetime: admission expires the old ImageID immediately, but an independent
-reader that pinned the image before admission may finish on the unchanged
-bytes. New init/exec operations reject the expired ImageID. Do not overwrite
-or remove the physical bytes until every prior reader/init/exec reference
-ends (or reuse the window immediately if no reference remains). A successful
-load publishes a fresh, never-recycled ImageID only after copying the new
-bytes. No multi-image RAM store is defined here.
+publishing its nonzero metadata-notification token; it then publishes
+lifecycle `Valid=1` as the final commit store. The designated notification
+reader observes an outstanding token when it is nonzero and differs from ack;
+it may acknowledge stale metadata even if `Valid=0`, without acquiring an
+image. New init/exec readers instead require `Valid=1` regardless of whether
+the notification token has already been acknowledged. Descriptor ack means only
+“metadata consumed”; it does not change descriptor `Valid`, release image
+bytes, or alone permit image-window overwrite. Logical validity is distinct
+from byte lifetime:
+admission expires the old ImageID immediately by storing `Valid=0`, without
+resetting descriptor valid/ack tokens. This precedes source read/assembly,
+validation, or storage; a queued/unadmitted attempt does nothing. Failure
+leaves `Valid=0` and no valid ImageID. An independent reader that pinned the
+image before admission may finish on unchanged bytes, but no write may
+overwrite them until all such references end. New init/exec operations reject
+the expired ID. If no prior reference remains, the single image window can be
+reused immediately.
+
+For successful commit, after waiting for any prior descriptor metadata
+publication to be acknowledged and any pinned image reader to release, the
+producer copies the complete length-prefixed image, prepares the descriptor
+fields, and publishes a fresh nonzero descriptor publication token. It then
+stores lifecycle `Valid=1` as the final commit store under the common
+synchronization mechanism. Descriptor acknowledgment only advances the
+metadata publication slot; it never sets or clears lifecycle `Valid`, nor
+authorizes overwrite while image references remain. Every admitted load
+attempt consumes a fresh nonzero, never-recycled generation value, including
+failures. Descriptor `Generation` records only the latest successful image;
+failed attempts may leave gaps and do not change this field. No multi-image
+RAM store is defined here.
 
 ## Control map and wire records
 
 The control map begins at physical `0x3FFD0000`; kernel virtual users add the
 mapping offset. The v1 map is little-endian uint32 words, and every listed
-offset is relative to the control base. The bootstrap is a distinct reserved
-256-byte segment `[+0x000,+0x100)`. It contains magic `0x46324331` at `+0x00`
-(bytes `31 43 32 46`), version 1 at `+0x04`, capabilities (zero) at `+0x08`,
-ready at `+0x0C`, control physical base at `+0x10`, image physical base at
-`+0x14`, and buffer physical base at `+0x18`; all remaining bootstrap bytes
-are reserved zero. The bootstrap producer clears ready before modifying any
-bootstrap fields and stores ready=1 last. A consumer rejects an unready,
-unknown magic, or unsupported version. Readiness is protocol initialization,
-not evidence that a mailbox contains a message.
+offset is relative to the control base. Host bootstrap metadata occupies
+`[+0x000,+0x100)` (256 bytes): magic `0x46324331` at `+0x00` (bytes
+`31 43 32 46`), version 1 at `+0x04`, capabilities (zero) at `+0x08`, host
+bootstrap-ready at `+0x0C`, control physical base at `+0x10`, image physical
+base at `+0x14`, buffer physical base at `+0x18`, and effective executable
+length at `+0x1C`. The 56 words from `+0x20` through `+0xFF` are reserved zero.
+Host prepares metadata and executable bytes before Boot, clears its ready
+field before changes, and publishes that ready word last. The kernel rejects
+an unready host bootstrap, unknown magic, or unsupported version.
+
+Executable bootstrap bytes occupy the separate range `[+0x200,+0x300)`
+(256-byte maximum). Effective length must be nonzero, no greater than 256,
+and a multiple of 4 bytes, matching the ZEPA fetch step (`PC += 4`); unused
+bytes are zero. `[+0x1A0,+0x200)` is a reserved, zero-filled 96-byte gap, not
+executable payload. The five mailbox records end at `+0x1A0`;
+`ControlUsedBytes` is `0x300` including the executable bytes.
+
+Host bootstrap-ready at `control+0x00C` is distinct from kernel status-ready
+at `control+0x108`. The host prepares its metadata and executable bootstrap
+before Boot and publishes host readiness. Only kernel initialization after
+its ASM setup writes `status.ready=1`, last in the status record; host code
+does not assert this readiness. Before kernel setup, protocol status is
+uninitialized/unready. Neither ready word substitutes for descriptor
+lifecycle `Valid` or a mailbox publication token.
 
 Five independent word-aligned structures follow:
 
 | Offset / size | Owner and word fields (offset relative to structure) |
 |---|---|
-| `+0x100 / 0x20` status | status producer: version `+0x00` (1), phase `+0x04`, ready `+0x08` (published last), reserved `+0x0C` |
-| `+0x120 / 0x20` descriptor | ZEPA loader publishes; controller/handler reader consumes: ImageID `+0x00`, payload length `+0x04`, physical image base `+0x08`, generation `+0x0C`, valid token `+0x10`, ack token `+0x14`; `+0x18..+0x1F` reserved |
+| `+0x100 / 0x20` status | kernel writes after ASM setup: version `+0x00` (1), phase `+0x04`, ready `+0x08` (publish last), reserved `+0x0C..+0x1F` |
+| `+0x120 / 0x20` descriptor | ZEPA loader publishes; controller/handler reader consumes: ImageID `+0x00`, payload length `+0x04`, physical image base `+0x08`, generation `+0x0C`, metadata valid token `+0x10`, metadata ack token `+0x14`, lifecycle Valid (`0`/`1`) `+0x18`, reserved zero `+0x1C` |
 | `+0x140 / 0x20` request | host or syscall-trap ingress publishes; kernel controller consumes: kind `+0x00`, ImageID `+0x04`, PID `+0x08`, v1 flags=0 `+0x0C`, valid token `+0x10`, ack token `+0x14`, RequestID `+0x18`, reserved `+0x1C` |
 | `+0x160 / 0x20` result | controller publishes; designated result reader consumes: kind `+0x00`, reason `+0x04`, PID `+0x08`, ImageID `+0x0C`, RequestID `+0x10`, valid token `+0x14`, ack token `+0x18`, termination code `+0x1C` |
 | `+0x180 / 0x20` event | event producer publishes; designated event reader consumes: kind `+0x00`, reason `+0x04`, PID `+0x08`, ImageID `+0x0C`, RequestID `+0x10`, valid token `+0x14`, ack token `+0x18`, reserved `+0x1C` |
 
-The bootstrap and every slot are separate; no segment is overlaid. For every
-slot, one producer owns its payload and valid token, and one designated
-consumer owns its ack token. The producer waits until valid equals ack (or
-both are zero), writes payload under common host/VM serialization or an
+The bootstrap metadata, reserved gap, executable bytes, and every mailbox
+slot are distinct; no ranges are overlaid. For every mailbox slot, one
+producer owns its payload and valid token, and one designated consumer owns
+its ack token. The producer waits until token-valid equals token-ack (or both
+are zero), writes slot payload under common host/VM serialization or an
 equivalent release/acquire synchronization mechanism, then publishes a new
-nonzero valid token last. Readers act only when valid is nonzero and differs
-from ack. Readiness and token validity are independent. Token counters are
-unique per slot for one negotiated session and are never reused. Exhaustion
-ends the session or requires a newly negotiated epoch; wraparound is not a
-valid reuse strategy. The contract defines no implicit ack on read.
+nonzero token-valid. Readers consume a publication only when token-valid is
+nonzero and differs from ack. The descriptor's lifecycle `Valid` is an
+additional independent gate: image validators require `Valid=1` even if its
+publication token has already been acknowledged. Ack does not make an invalid
+descriptor valid. Descriptor metadata reuse waits for acknowledgment of the
+previous descriptor publication; image-byte overwrite separately waits for
+all pinned readers. Readiness, lifecycle `Valid`, and publication tokens are
+independent. Token counters are unique per slot for one negotiated session
+and are never reused. Exhaustion ends the session or requires a newly
+negotiated epoch; wraparound is not a valid reuse strategy. The contract
+defines no implicit ack on read.
+
+Init/exec validation also requires host bootstrap-ready=1, kernel
+`status.ready=1` (kernel setup is complete), and descriptor lifecycle
+`Valid=1`. It must require `Valid=1` even after the descriptor notification
+token has already been acknowledged, and verify nonzero/matching ImageID,
+supported version, payload length and alignment/capacity, equality with the
+little-endian window length prefix, and valid source mapping. An admitted
+load first writes `Valid=0` without resetting valid/ack tokens and consumes a
+fresh generation; it waits for descriptor metadata ack before reusing those
+fields and for pinned byte references before any overwrite. On failure,
+`Valid` remains zero and descriptor `Generation` still names the last
+successful image. On success, after copying the full image/prefix and writing
+descriptor ImageID, length, base, successful generation, reserved zero, and
+a new notification token, the producer writes `Valid=1` last under the common
+synchronization mechanism. Token ack never writes lifecycle `Valid`. The
+generation allocator is a future owner responsibility: every admitted load,
+including a failure, consumes a fresh nonzero value; only successful values
+are copied into descriptor `Generation`, so gaps are expected.
 
 ## Ownership, operation order, and backpressure
 
@@ -267,3 +325,12 @@ register conventions do not add syscall or argv semantics. The scoped exec
 boundary remains `SYSCALL #5` with ImageID in W8; the existing syscall
 instruction places its immediate in W9. Front 1's contract remains the
 authority for all other syscall and argv details.
+
+## General ordering and lifetime references
+
+The ordering and reference-lifetime rationale follows general principles
+described in the [Linux kernel memory-barrier documentation](https://docs.kernel.org/core-api/wrappers/memory-barriers.html)
+and [Linux `kref` documentation](https://docs.kernel.org/core-api/kref.html).
+These references are conceptual guidance only: ZEPA's numeric offsets,
+readiness fields, tokens, and publication ABI are original to this contract,
+not Linux ABI or a claim of Linux runtime behavior.

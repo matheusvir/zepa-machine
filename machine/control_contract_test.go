@@ -31,11 +31,71 @@ func TestControlStructureTableAlignmentAndBounds(t *testing.T) {
 			t.Errorf("%s overlaps %s", segments[i-1].name, segment.name)
 		}
 	}
-	if ControlUsedBytes != 0x1A0 || ControlBootstrapSize != 256 || ControlMagic != 0x46324331 || ControlProtocolVersion != 1 {
+	if ControlUsedBytes != 0x300 || ControlBootstrapSize != 256 || ControlMagic != 0x46324331 || ControlProtocolVersion != 1 {
 		t.Fatal("bootstrap/control v1 constants changed")
+	}
+	if ControlReservedGapOffset != 0x1A0 || ControlReservedGapSize != 0x60 || ControlExecutableBytesOffset != 0x200 || ControlExecutableBytesSize != 256 || ZEPAInstructionBytes != 4 {
+		t.Fatal("reserved gap or executable bootstrap range changed")
+	}
+	if ControlReservedGapOffset+ControlReservedGapSize != ControlExecutableBytesOffset ||
+		ControlExecutableBytesOffset%ZEPAInstructionBytes != 0 ||
+		ControlExecutableBytesOffset+ControlExecutableBytesSize > uint32(ControlRegionEnd-ControlRegionStart) {
+		t.Fatal("executable bootstrap alignment or control-region bounds changed")
 	}
 	if ControlStatusOffset != 0x100 || ControlImageDescriptorOffset != 0x120 || ControlRequestOffset != 0x140 || ControlResultOffset != 0x160 || ControlEventOffset != 0x180 {
 		t.Fatal("control record offsets changed")
+	}
+}
+
+func TestExecutableBootstrapLengthBoundaries(t *testing.T) {
+	tests := []struct {
+		length  uint32
+		wantErr bool
+	}{
+		{0, true},
+		{1, true},
+		{3, true},
+		{4, false},
+		{256, false},
+		{260, true},
+	}
+	for _, test := range tests {
+		if err := ValidateExecutableBootstrapLength(test.length); (err != nil) != test.wantErr {
+			t.Errorf("ValidateExecutableBootstrapLength(%d) error = %v", test.length, err)
+		}
+	}
+}
+
+func TestBootstrapWireBytesAndReservedPadding(t *testing.T) {
+	var control [ControlUsedBytes]byte
+	binary.LittleEndian.PutUint32(control[BootstrapExecutableLengthOffset:], 4)
+	if got := binary.LittleEndian.Uint32(control[0x1C:]); got != 4 {
+		t.Fatalf("encoded executable length = %d", got)
+	}
+	if unsafe.Offsetof(ControlBootstrap{}.ExecutableLength) != uintptr(BootstrapExecutableLengthOffset) || BootstrapExecutableLengthOffset != 0x1C {
+		t.Fatalf("executable length field offset = %d", unsafe.Offsetof(ControlBootstrap{}.ExecutableLength))
+	}
+	for i, value := range control[0x20:ControlBootstrapSize] {
+		if value != 0 {
+			t.Fatalf("reserved bootstrap byte %#x is nonzero", i+0x20)
+		}
+	}
+	copy(control[ControlExecutableBytesOffset:], []byte{0x10, 0x20, 0x30, 0x40})
+	for i, value := range control[ControlReservedGapOffset:ControlExecutableBytesOffset] {
+		if value != 0 {
+			t.Fatalf("reserved control gap byte %#x is nonzero", uint32(i)+ControlReservedGapOffset)
+		}
+	}
+	for i, value := range control[ControlExecutableBytesOffset+4 : ControlExecutableBytesOffset+ControlExecutableBytesSize] {
+		if value != 0 {
+			t.Fatalf("unused executable byte %#x is nonzero", uint32(i)+ControlExecutableBytesOffset+4)
+		}
+	}
+	if got := binary.LittleEndian.Uint32(control[ControlExecutableBytesOffset:]); got != 0x40302010 {
+		t.Fatalf("executable bytes fixture word = %#x", got)
+	}
+	if ControlExecutableBytesOffset+ControlExecutableBytesSize != ControlUsedBytes {
+		t.Fatal("executable bootstrap does not end at ControlUsedBytes")
 	}
 }
 
@@ -140,14 +200,136 @@ func TestControlRecordStructSizesAndFieldOffsets(t *testing.T) {
 	if unsafe.Offsetof(ControlStatus{}.Version) != uintptr(StatusVersionOffset) ||
 		unsafe.Offsetof(ControlStatus{}.Phase) != uintptr(StatusPhaseOffset) ||
 		unsafe.Offsetof(ControlStatus{}.Ready) != uintptr(StatusReadyOffset) ||
+		ControlStatusOffset+StatusReadyOffset != 0x108 || ControlStatusOffset+StatusReadyOffset == BootstrapReadyOffset ||
 		unsafe.Offsetof(ControlStatus{}.Reserved) != uintptr(StatusReservedOffset) ||
 		unsafe.Offsetof(ImageDescriptor{}.Length) != uintptr(DescriptorLengthOffset) ||
 		unsafe.Offsetof(ImageDescriptor{}.ValidToken) != uintptr(DescriptorValidTokenOffset) ||
 		unsafe.Offsetof(ImageDescriptor{}.AckToken) != uintptr(DescriptorAckTokenOffset) ||
+		unsafe.Offsetof(ImageDescriptor{}.Valid) != uintptr(DescriptorValidOffset) ||
+		unsafe.Offsetof(ImageDescriptor{}.Reserved) != uintptr(DescriptorReservedOffset) ||
 		unsafe.Offsetof(ControlRequest{}.RequestID) != uintptr(RequestIDOffset) ||
 		unsafe.Offsetof(ControlResult{}.TerminationCode) != uintptr(ResultTerminationCodeOffset) ||
 		unsafe.Offsetof(ControlEvent{}.Reserved) != uintptr(EventReservedOffset) {
 		t.Fatal("control struct field offsets differ from wire offsets")
+	}
+}
+
+func TestDescriptorValidityLifecycleFixture(t *testing.T) {
+	// This byte-array fixture documents protocol state transitions only. It is
+	// not a loader, queue, or production lifecycle implementation.
+	var descriptor [ControlImageDescriptorSize]byte
+	imageWindow := []byte{4, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD}
+	originalImage := append([]byte(nil), imageWindow...)
+	pinnedReader := true
+	binary.LittleEndian.PutUint32(descriptor[DescriptorImageIDOffset:], 21)
+	binary.LittleEndian.PutUint32(descriptor[DescriptorLengthOffset:], 4)
+	binary.LittleEndian.PutUint32(descriptor[DescriptorGenerationOffset:], 7)
+	binary.LittleEndian.PutUint32(descriptor[DescriptorValidTokenOffset:], 12)
+	binary.LittleEndian.PutUint32(descriptor[DescriptorAckTokenOffset:], 11)
+	binary.LittleEndian.PutUint32(descriptor[DescriptorValidOffset:], ImageDescriptorValid)
+	nextGeneration := uint32(8)
+	if binary.LittleEndian.Uint32(descriptor[DescriptorValidOffset:]) != ImageDescriptorValid {
+		t.Fatal("descriptor validity must not depend on whether its token is acknowledged")
+	}
+	// An already-acknowledged descriptor still requires and retains Valid=1.
+	acknowledgedDescriptor := descriptor
+	binary.LittleEndian.PutUint32(acknowledgedDescriptor[DescriptorAckTokenOffset:], 12)
+	if got := binary.LittleEndian.Uint32(acknowledgedDescriptor[DescriptorValidOffset:]); got != ImageDescriptorValid {
+		t.Fatalf("descriptor ack changed lifecycle Valid: %d", got)
+	}
+
+	// Admission immediately invalidates the old image but cannot reset or
+	// appropriate the metadata publication tokens.
+	failedAttemptGeneration := nextGeneration
+	nextGeneration++
+	binary.LittleEndian.PutUint32(descriptor[DescriptorValidOffset:], ImageDescriptorInvalid)
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorValidOffset:]); got != ImageDescriptorInvalid {
+		t.Fatalf("admission Valid = %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorValidTokenOffset:]); got != 12 {
+		t.Fatalf("admission changed valid token: %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorAckTokenOffset:]); got != 11 {
+		t.Fatalf("admission changed ack token: %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorGenerationOffset:]); got != 7 {
+		t.Fatalf("admission changed successful generation: %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorImageIDOffset:]); got != 21 {
+		t.Fatalf("admission changed descriptor metadata before ack: %d", got)
+	}
+	if validToken, ackToken := binary.LittleEndian.Uint32(descriptor[DescriptorValidTokenOffset:]), binary.LittleEndian.Uint32(descriptor[DescriptorAckTokenOffset:]); validToken == ackToken {
+		t.Fatal("fixture expected the prior descriptor metadata to remain pending")
+	}
+	// Failure leaves Valid=0 and preserves the most recent successful generation.
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorValidOffset:]); got != 0 || failedAttemptGeneration != 8 {
+		t.Fatalf("failed load state Valid=%d consumed generation=%d", got, failedAttemptGeneration)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorGenerationOffset:]); got != 7 {
+		t.Fatalf("failed attempt replaced successful generation: %d", got)
+	}
+
+	// Ack the prior metadata publication; it still does not modify lifecycle
+	// Valid, and only now may descriptor metadata be reused.
+	binary.LittleEndian.PutUint32(descriptor[DescriptorAckTokenOffset:], 12)
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorValidOffset:]); got != ImageDescriptorInvalid {
+		t.Fatalf("ack changed an invalid descriptor's lifecycle Valid: %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorAckTokenOffset:]); got != 12 {
+		t.Fatalf("ack of prior descriptor token = %d", got)
+	}
+	if pinnedReader && !reflect.DeepEqual(imageWindow, originalImage) {
+		t.Fatal("admitted failed attempt changed bytes held by a pinned reader")
+	}
+	pinnedReader = false
+	if pinnedReader {
+		t.Fatal("fixture reader should have released before overwrite")
+	}
+	// A second admitted attempt consumes a new generation, leaving a gap
+	// because failed attempt generation 8 is retired.
+	successGeneration := nextGeneration
+	nextGeneration++
+	if successGeneration != 9 {
+		t.Fatalf("successful attempt generation = %d, want gap after failure", successGeneration)
+	}
+
+	copy(imageWindow, make([]byte, len(imageWindow)))
+	binary.LittleEndian.PutUint32(imageWindow, 4)
+	copy(imageWindow[ImageLengthPrefixBytes:], []byte{1, 2, 3, 4})
+	publicationOrder := []string{"image-prefix-and-payload"}
+	binary.LittleEndian.PutUint32(descriptor[DescriptorImageIDOffset:], 22)
+	publicationOrder = append(publicationOrder, "image-id")
+	binary.LittleEndian.PutUint32(descriptor[DescriptorLengthOffset:], 4)
+	publicationOrder = append(publicationOrder, "length")
+	binary.LittleEndian.PutUint32(descriptor[DescriptorGenerationOffset:], successGeneration)
+	publicationOrder = append(publicationOrder, "generation")
+	binary.LittleEndian.PutUint32(descriptor[DescriptorValidTokenOffset:], 13)
+	publicationOrder = append(publicationOrder, "valid-token")
+	binary.LittleEndian.PutUint32(descriptor[DescriptorValidOffset:], ImageDescriptorValid)
+	publicationOrder = append(publicationOrder, "lifecycle-valid")
+	if publicationOrder[len(publicationOrder)-1] != "lifecycle-valid" {
+		t.Fatal("descriptor Valid was not the final commit store")
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorValidOffset:]); got != 1 {
+		t.Fatalf("successful commit Valid = %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorGenerationOffset:]); got != 9 {
+		t.Fatalf("successful descriptor generation = %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorImageIDOffset:]); got != 22 {
+		t.Fatalf("successful descriptor ImageID = %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(imageWindow); got != binary.LittleEndian.Uint32(descriptor[DescriptorLengthOffset:]) {
+		t.Fatalf("committed prefix=%d descriptor length=%d", got, binary.LittleEndian.Uint32(descriptor[DescriptorLengthOffset:]))
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorAckTokenOffset:]); got != 12 {
+		t.Fatalf("publication unexpectedly changed ack token: %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorValidTokenOffset:]); got != 13 {
+		t.Fatalf("successful metadata publication token = %d", got)
+	}
+	if got := binary.LittleEndian.Uint32(descriptor[DescriptorReservedOffset:]); got != 0 {
+		t.Fatalf("descriptor reserved word = %d", got)
 	}
 }
 

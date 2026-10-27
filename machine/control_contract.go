@@ -10,6 +10,7 @@ import (
 const (
 	ControlProtocolVersion       uint32 = 1
 	ControlWordBytes             uint32 = 4
+	ZEPAInstructionBytes         uint32 = 4
 	ControlBootstrapOffset       uint32 = 0x000
 	ControlBootstrapSize         uint32 = 0x100
 	ControlStatusOffset          uint32 = 0x100
@@ -22,7 +23,11 @@ const (
 	ControlResultSize            uint32 = 0x020
 	ControlEventOffset           uint32 = 0x180
 	ControlEventSize             uint32 = 0x020
-	ControlUsedBytes             uint32 = 0x1A0
+	ControlReservedGapOffset     uint32 = 0x1A0
+	ControlReservedGapSize       uint32 = 0x060
+	ControlExecutableBytesOffset uint32 = 0x200
+	ControlExecutableBytesSize   uint32 = 0x100
+	ControlUsedBytes             uint32 = 0x300
 	ControlMagic                 uint32 = 0x46324331
 	ControlCapabilitiesV1        uint32 = 0
 	ImageLengthPrefixBytes       uint32 = 4
@@ -30,16 +35,19 @@ const (
 	MaxImagePayloadBytes         uint32 = ImageWindowBytes - ImageLengthPrefixBytes
 	TransferBufferBytes          uint32 = uint32(TransferBufferEnd - TransferBufferStart)
 	MaxPendingEvents             uint32 = 1
+	ImageDescriptorInvalid       uint32 = 0
+	ImageDescriptorValid         uint32 = 1
 )
 
 const (
-	BootstrapMagicOffset           uint32 = 0x00
-	BootstrapVersionOffset         uint32 = 0x04
-	BootstrapCapabilitiesOffset    uint32 = 0x08
-	BootstrapReadyOffset           uint32 = 0x0C
-	BootstrapControlPhysicalOffset uint32 = 0x10
-	BootstrapImagePhysicalOffset   uint32 = 0x14
-	BootstrapBufferPhysicalOffset  uint32 = 0x18
+	BootstrapMagicOffset            uint32 = 0x00
+	BootstrapVersionOffset          uint32 = 0x04
+	BootstrapCapabilitiesOffset     uint32 = 0x08
+	BootstrapReadyOffset            uint32 = 0x0C
+	BootstrapControlPhysicalOffset  uint32 = 0x10
+	BootstrapImagePhysicalOffset    uint32 = 0x14
+	BootstrapBufferPhysicalOffset   uint32 = 0x18
+	BootstrapExecutableLengthOffset uint32 = 0x1C
 
 	StatusVersionOffset  uint32 = 0x00
 	StatusPhaseOffset    uint32 = 0x04
@@ -52,6 +60,8 @@ const (
 	DescriptorGenerationOffset   uint32 = 0x0C
 	DescriptorValidTokenOffset   uint32 = 0x10
 	DescriptorAckTokenOffset     uint32 = 0x14
+	DescriptorValidOffset        uint32 = 0x18
+	DescriptorReservedOffset     uint32 = 0x1C
 
 	RequestKindOffset       uint32 = 0x00
 	RequestImageIDOffset    uint32 = 0x04
@@ -149,7 +159,8 @@ const (
 type ControlBootstrap struct {
 	Magic, Version, Capabilities, Ready                        uint32
 	ControlBasePhysical, ImageBasePhysical, BufferBasePhysical uint32
-	Reserved                                                   [57]uint32
+	ExecutableLength                                           uint32
+	Reserved                                                   [56]uint32
 }
 
 // ControlStatus occupies 0x100..0x11F. Ready is published after initialization.
@@ -169,7 +180,8 @@ type ImageDescriptor struct {
 	Generation   uint32
 	ValidToken   PublicationToken
 	AckToken     PublicationToken
-	Reserved     [2]uint32
+	Valid        uint32
+	Reserved     uint32
 }
 
 // ControlRequest occupies 0x140..0x15F. V1 flags are zero.
@@ -229,9 +241,19 @@ func ValidateImageDescriptorLength(descriptorLength, prefixedLength uint32) erro
 	return nil
 }
 
+// ValidateExecutableBootstrapLength validates the effective host-provided
+// bootstrap program size without reading, assembling, or executing bytes.
+func ValidateExecutableBootstrapLength(length uint32) error {
+	if length == 0 || length > ControlExecutableBytesSize || length%ZEPAInstructionBytes != 0 {
+		return ErrInvalidExecutableBootstrapLength
+	}
+	return nil
+}
+
 var (
-	ErrInvalidImageLength       = errors.New("machine: invalid image payload length")
-	ErrDescriptorLengthMismatch = errors.New("machine: descriptor length does not match image prefix")
+	ErrInvalidImageLength               = errors.New("machine: invalid image payload length")
+	ErrDescriptorLengthMismatch         = errors.New("machine: descriptor length does not match image prefix")
+	ErrInvalidExecutableBootstrapLength = errors.New("machine: invalid executable bootstrap length")
 )
 
 // UnavailableImageError reports an absent or already retired ImageID.
