@@ -7,12 +7,15 @@ package machine
 // to 44/76 bytes. The latter compares child W9 to zero although specs.md says -2.
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	assembler "zepa-machine/cross-assembler"
 )
@@ -284,15 +287,157 @@ func (f *kernelFixture) runToMRET(from string, limit int) {
 
 func (f *kernelFixture) fail(reason string) {
 	f.t.Helper()
-	pc := f.m.registers[pc]
-	nearest := "<none>"
+	f.t.Fatal(f.diagnostic(reason))
+}
+
+// Diagnostics must not fault again when the CPU or page tables are corrupt.
+// Read effective page tables and physical memory without invoking translate,
+// which changes exception registers and may itself index beyond the backing.
+func (f *kernelFixture) diagnostic(reason string) string {
+	pcValue := f.m.registers[pc]
+	label := "<outside-kernel>"
+	nearest := ""
 	var best uint32
-	for name, addr := range f.labels {
-		if pc >= kernelBoundary && addr <= pc-kernelBoundary && (nearest == "<none>" || addr > best) {
-			nearest, best = name, addr
+	if pcValue >= kernelBoundary {
+		label = "<none>"
+		for name, addr := range f.labels {
+			if addr <= pcValue-kernelBoundary && (nearest == "" || addr > best || (addr == best && name < nearest)) {
+				nearest, best = name, addr
+			}
+		}
+		if nearest != "" {
+			label = fmt.Sprintf("%s+%#x", nearest, pcValue-kernelBoundary-best)
 		}
 	}
-	f.t.Fatalf("%s: phase=%s PC=%#x label=%s+%#x PID=%d PCB0.w9=%#x ecr=%d efa=%#x", reason, f.phase, pc, nearest, pc-kernelBoundary-best, f.get(0x2010), f.get(legacyPCB+56), f.m.registers[ecr], f.m.registers[efa])
+	physicalWord := func(addr uint64) (uint32, bool) {
+		if addr+4 > uint64(len(f.m.memory)) {
+			return 0, false
+		}
+		return binary.LittleEndian.Uint32(f.m.memory[int(addr) : int(addr)+4]), true
+	}
+	kernelPTE := func(addr uint64) (uint32, bool) {
+		if addr >= 1<<32-uint64(kernelBoundary) || !f.m.isMmuEnabled() {
+			return 0, false
+		}
+		return physicalWord(uint64(f.m.registers[kptr]) + addr/pageSize*4)
+	}
+	kernelWord := func(addr uint64) (uint32, bool) {
+		if addr >= 1<<32-uint64(kernelBoundary) || addr%4 != 0 || addr%pageSize > pageSize-4 {
+			return 0, false
+		}
+		if !f.m.isMmuEnabled() {
+			return physicalWord(uint64(kernelBoundary) + addr)
+		}
+		if !f.m.isKernelMode() {
+			return 0, false
+		}
+		pte, ok := kernelPTE(addr)
+		if !ok || pte&isPteMappedMask == 0 {
+			return 0, false
+		}
+		return physicalWord(uint64(pte&0xfffff)*pageSize + addr%pageSize)
+	}
+	formatWord := func(value uint32, ok bool) string {
+		if !ok {
+			return "<unavailable>"
+		}
+		return fmt.Sprintf("%#x", value)
+	}
+	pid, pidOK := kernelWord(0x2010)
+	pidText := "<unavailable>"
+	w9Text, pagesText, pteText, bitmapText, mappingText := "<unavailable>", "<unavailable>", "<unavailable>", "<unavailable>", "<unavailable>"
+	if pidOK {
+		pidText = fmt.Sprint(pid)
+		if pid < 256 {
+			base := uint64(legacyPCB) + uint64(pid)*legacyStride
+			mapping, mappingOK := kernelPTE(base + 56)
+			mappingText = formatWord(mapping, mappingOK)
+			value, ok := kernelWord(base + 56)
+			w9Text = formatWord(value, ok)
+			value, ok = kernelWord(base + 76)
+			pagesText = formatWord(value, ok)
+			pte, ok := kernelWord(base + 80)
+			pteText = formatWord(pte, ok)
+			if ok && pte&isPteMappedMask != 0 {
+				frame := pte & 0xfffff
+				bitmap, mapped := kernelWord(uint64(legacyBitmap) + uint64(frame/32)*4)
+				if mapped {
+					bitmapText = fmt.Sprintf("frame=%d word=%#x bit=%d", frame, bitmap, (bitmap>>(frame%32))&1)
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("%s: phase=%s PC=%#x label=%s PID=%s PCB.w9=%s PCB.pages_used=%s PCB.pte[0]=%s bitmap=%s PCB.w9_mapping_pte=%s KPTR=%#x UPTR=%#x ecr=%d efa=%#x", reason, f.phase, pcValue, label, pidText, w9Text, pagesText, pteText, bitmapText, mappingText, f.m.registers[kptr], f.m.registers[uptr], f.m.registers[ecr], f.m.registers[efa])
+}
+
+func TestKernelFixtureBudgetDiagnostic(t *testing.T) {
+	const childEnv = "ZEPA_FIXTURE_BUDGET_DIAGNOSTIC_CHILD"
+	if os.Getenv(childEnv) == "1" {
+		f := newKernelFixture(t)
+		pcb := uint32(legacyPCB + legacyStride)
+		f.put(0x2010, 1)
+		f.put(pcb+56, 0x12345678)
+		f.put(pcb+76, 7)
+		f.put(pcb+80, isPteMappedMask|1)
+		f.run("loop", "schedule", 3)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestKernelFixtureBudgetDiagnostic$", "-test.count=1")
+	cmd.Env = append(os.Environ(), childEnv+"=1")
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("budget diagnostic child timed out: %s", output)
+	}
+	if err == nil {
+		t.Fatalf("expected child test to fail on budget exhaustion: %s", output)
+	}
+	if _, ok := err.(*exec.ExitError); !ok {
+		t.Fatalf("running child test: %v", err)
+	}
+	for _, want := range []string{"step budget 3 exhausted", "phase=loop", "label=loop+0x0", "PID=1", "PCB.w9=0x12345678", "PCB.pages_used=0x7", "PCB.pte[0]=0x100001", "bitmap=frame=1 word=0xffffffff bit=1", "PC=0x", "KPTR=", "UPTR="} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("budget diagnostic missing %q: %s", want, output)
+		}
+	}
+}
+
+func TestKernelFixtureDiagnosticUnavailable(t *testing.T) {
+	f := newKernelFixture(t)
+	f.phase = "user-return"
+	f.m.registers[pc] = 8
+	f.put(0x2010, ^uint32(0))
+	text := f.diagnostic("probe")
+	for _, want := range []string{"PC=0x8", "label=<outside-kernel>", "PID=4294967295", "PCB.w9=<unavailable>", "PCB.pages_used=<unavailable>", "PCB.pte[0]=<unavailable>", "bitmap=<unavailable>"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("diagnostic missing %q: %s", want, text)
+		}
+	}
+	f.put(0x2010, 200)
+	if text := f.diagnostic("unmapped PCB"); !strings.Contains(text, "PID=200 PCB.w9=<unavailable>") {
+		t.Fatalf("unmapped PCB diagnostic: %s", text)
+	}
+	pcb := uint32(legacyPCB + legacyStride)
+	f.put(0x2010, 1)
+	f.put(pcb+56, 0x12345678)
+	f.put(pcb+76, 7)
+	f.put(pcb+80, isPteMappedMask|1)
+	pteAddr := fixtureKPTR + (pcb/pageSize)*4
+	if _, ok := f.pages[pcb/pageSize]; !ok {
+		t.Fatal("expected PCB backing")
+	}
+	binary.LittleEndian.PutUint32(f.m.memory[pteAddr:], 0)
+	text = f.diagnostic("invalid PCB PTE")
+	for _, want := range []string{"PID=1", "PCB.w9=<unavailable>", "PCB.pages_used=<unavailable>", "PCB.pte[0]=<unavailable>", "bitmap=<unavailable>", "PCB.w9_mapping_pte=0x0"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("invalid PCB PTE diagnostic missing %q: %s", want, text)
+		}
+	}
+	binary.LittleEndian.PutUint32(f.m.memory[fixtureKPTR+(0x2000/pageSize)*4:], 0)
+	if text := f.diagnostic("unmapped"); !strings.Contains(text, "PID=<unavailable>") {
+		t.Fatalf("unmapped global diagnostic: %s", text)
+	}
 }
 
 func TestKernelFixtureHandlerAndIsolation(t *testing.T) {
