@@ -1,10 +1,11 @@
 package assembler
 
 import (
-	"bytes"
 	"strconv"
 	"strings"
 	"testing"
+
+	"zepa-machine/machine"
 )
 
 // Samples and marker layout introduced by F2-04. Values are 16-bit positives so
@@ -23,9 +24,6 @@ const (
 
 	// Marker slots start at 0x0100, so both samples must stay below it.
 	markerSlotsStart = 0x0100
-
-	// F2-01 reserves [control+0x000, control+0x100) for the bootstrap.
-	bootstrapMaxBytes = 256
 )
 
 // loadSampleInstructions parses a sample without assembling it, so tests can
@@ -238,26 +236,19 @@ func TestExecSamplesUseExistingOpcodes(t *testing.T) {
 }
 
 func TestBootstrapAssemblyFitsControlSegment(t *testing.T) {
-	// F2-04 pins the 256-byte budget of the dedicated control bootstrap
-	// segment. The runtime producer is F2-16; this fixture proves that a
-	// bootstrap can be host-assembled with the existing syntax and fits.
-	const bootstrapSource = `
-_start:
-    MV W8, #0      ; exit status
-    SYSCALL #2     ; exit()
-`
-
-	memory, err := RunAssemblerFromReader(bytes.NewBufferString(bootstrapSource))
+	// exec_intermediate.asm is the bootstrap: the host assembles it and
+	// publishes its bytes in the executable range control [+0x200, +0x300)
+	// (F2-16), and init copies them into the new process (F2-15). F2-01 only
+	// accepts an effective length that is nonzero, at most 256 bytes, and a
+	// multiple of the 4-byte instruction size.
+	memory, err := RunAssembler(execIntermediateSample)
 	if err != nil {
-		t.Fatalf("failed to assemble bootstrap fixture: %v", err)
+		t.Fatalf("failed to assemble bootstrap %s: %v", execIntermediateSample, err)
 	}
-	if len(memory) == 0 {
-		t.Fatal("bootstrap fixture assembled to an empty image")
-	}
-	if len(memory)%4 != 0 {
-		t.Fatalf("bootstrap size %d is not a whole number of 32-bit instructions", len(memory))
-	}
-	if len(memory) > bootstrapMaxBytes {
-		t.Fatalf("bootstrap uses %d bytes, exceeding the %d-byte control segment", len(memory), bootstrapMaxBytes)
+
+	length := uint32(len(memory))
+	if err := machine.ValidateExecutableBootstrapLength(length); err != nil {
+		t.Fatalf("bootstrap %s assembles to %d bytes, outside the %d-byte executable bootstrap range: %v",
+			execIntermediateSample, length, machine.ControlExecutableBytesSize, err)
 	}
 }

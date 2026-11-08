@@ -11,10 +11,11 @@
 ;   0x0108: 0x4453 ("DS") destination marker.
 ;   W0:     0x4453, live copy of the destination marker.
 ;
-; 0x0100 and 0x0104 belong to exec_intermediate.asm. This image never writes
-; them. If the exec implementation keeps the old user page contents, 0x0100
-; still holds 0x494E and 0x0104 remains untouched (no sentinel), which shows
-; that the destination replaced the intermediate without running its sentinel.
+; 0x0100 and 0x0104 belong to exec_intermediate.asm, and this image never
+; writes them. A successful exec releases the intermediate's pages and maps
+; zeroed frames, so both addresses read 0 after the replacement. Inspect the
+; intermediate marker before exec runs; afterwards, 0x4453 at 0x0108 and in W0
+; under the same PID shows that the destination replaced the intermediate.
 ;
 ; The emitted code stays below 0x0100 bytes, so the marker slot never overlaps
 ; it.
