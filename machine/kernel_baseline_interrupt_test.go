@@ -81,7 +81,8 @@ func TestBaselineKillInterruptOrphan(t *testing.T) {
 	f.put(legacyPCB+4, ^uint32(0))
 	f.put(legacyPCB+72, 9)
 	f.put(legacyPCB+76, 0)
-	f.run("kill_int", "schedule", 500)
+	prepareKillCleanup(f, 0)
+	f.run("kill_int", "schedule", killCleanupBudget)
 	if got := f.get(legacyPCB + 56); got != 2 || f.get(legacyPCB+72) != 8 {
 		t.Fatalf("orphan kill: W9=%#x flags=%#x; want 2 and 8", got, f.get(legacyPCB+72))
 	}
@@ -98,7 +99,8 @@ func TestBaselineKillInterruptZombie(t *testing.T) {
 	f.put(child+4, ^uint32(0))
 	f.put(child+72, 9)
 	f.put(child+76, 0)
-	f.run("kill_int", "schedule", 500)
+	prepareKillCleanup(f, 1)
+	f.run("kill_int", "schedule", killCleanupBudget)
 	if f.get(child+56) != 2 || f.get(child+72) != 11 || f.get(legacyPCB+4) != 1 || f.get(legacyPCB+72) != 9 {
 		t.Fatalf("zombie kill: W9=%#x flags=%#x parent child=%d flags=%#x", f.get(child+56), f.get(child+72), f.get(legacyPCB+4), f.get(legacyPCB+72))
 	}
