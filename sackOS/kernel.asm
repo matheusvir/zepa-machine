@@ -1,7 +1,7 @@
 setup:
-    STRD W0, #0x200C ; memory_size low addr
+    STRD W0, #0x400C ; memory_size low addr
 
-    MV UPTR, #0x2024    ; pcb_v low addr
+    MV UPTR, #0x4024    ; pcb_v low addr
     MV W1, #80           ; page_table offset
 
     ADD UPTR, UPTR, W1       ; UPTR = pcb_v[0].page_table address
@@ -11,15 +11,17 @@ setup:
     SHL W9, W9, W1           ; W9 = sets bit 20 (valid) to 1
     STORE W9, UPTR           ; identity mapping, allocates the first frame to the first page
 
-    MV W0, #0x3000
+    ; MV sign-extends: #0x9024 loads 0xFFFF9024 (-0x6FDC), so the high half is
+    ; 0x3001, not 0x3000: 0x30010000 - 0x6FDC = 0x30009024. Do not "fix" it.
+    MV W0, #0x3001
     MV W1, #16
     SHL W0, W0, W1
 
-    MV W1, #0x7024
-    ADD W0, W0, W1       ; W0 = 0x30007024 = kernel_page_table low first address
+    MV W1, #0x9024
+    ADD W0, W0, W1       ; W0 = 0x30009024 = kernel_page_table low first address
 
     MV W2, #0
-    ADD KPTR, W0, W2     ; KPTR = 0x30007024 = kernel_page_table low first address
+    ADD KPTR, W0, W2     ; KPTR = 0x30009024 = kernel_page_table low first address
 
     MV W1, #1
     MV W2, #20
@@ -63,11 +65,13 @@ setup:
     ADD W1, W9, UPTR   ; W1 = uptr virtual address
     STORE W0, W1       ; unmaps the identity, sets the pcb_v[0].page_table[0] to invalid
 
-    MV W0, #0x3010
+    ; MV sign-extends #0x9024 to 0xFFFF9024 (-0x6FDC), so the high half is
+    ; 0x3011, not 0x3010: 0x30110000 - 0x6FDC = 0x30109024. Do not "fix" it.
+    MV W0, #0x3011
     MV W1, #16
     SHL W0, W0, W1
-    MV W1, #0x7024
-    ADD W0, W0, W1     ; W0 = physical bitmap addr
+    MV W1, #0x9024
+    ADD W0, W0, W1     ; W0 = 0x30109024 = physical bitmap addr
     ADD W0, W0, W9     ; W0 = virtual bitmap addr
 
     MV W1, #1
@@ -90,22 +94,40 @@ setup:
     setup_end_populate_bitmap:
 
     MV W0, #-1
-    MV W1, #0x2010
+    MV W1, #0x4010
     ADD W1, W1, W9        ; W1 = running_pid virtual addr
     STORE W0, W1          ; running_pid = -1
 
-    MV SP, #0
-    MV W0, #0x2008
-    ADD W0, W0, W9                 ; W0 = buffer_size virtual addr
-    LOAD W0, W0
-
-    SUB SP, SP, W0                 ; SP = 4GB - buffer_size
-    MV W0, #0x2018
+    ; The kernel stack has its own reservation, physical [0x3FFC0000, 0x3FFD0000).
+    ; Its top is a constant, independent of BUFFER_SIZE, so pushes never reach
+    ; the control map, image window or transfer buffer above it.
+    MV SP, #-3                     ; SP = 0xFFFFFFFD
+    MV W0, #16
+    SHL SP, SP, W0                 ; SP = 0xFFFD0000 = kernel stack top (physical 0x3FFD0000)
+    MV W0, #0x4018
     ADD W0, W0, W9                 ; W0 = kernel_stack_pointer virtual addr
     STORE SP, W0                   ; sets kernel_stack_pointer
 
+    ; Publish readiness in the F2-01 control status record at control +0x100
+    ; (physical 0x3FFD0100, virtual 0xFFFD0100): version 1, phase ready (1), and
+    ; then ready = 1. Ready is the last store of setup: every kernel structure
+    ; above is final, and nothing is stored between it and the MRET below.
+    ; Setup does not read or write the host bootstrap or any other record.
+    MV W0, #0x3FFD
+    MV W1, #16
+    SHL W0, W0, W1                 ; W0 = 0x3FFD0000 = control region physical addr
+    MV W1, #0x0100
+    ADD W0, W0, W1                 ; W0 = 0x3FFD0100 = status record physical addr
+    ADD W0, W0, W9                 ; W0 = 0xFFFD0100 = status record virtual addr
+    MV W1, #1
+    MV W2, #4
+    STORE W1, W0                   ; status.version = 1
+    ADD W0, W0, W2
+    STORE W1, W0                   ; status.phase = 1 (ready)
+    ADD W0, W0, W2
+    STORE W1, W0                   ; status.ready = 1, the final setup store
 
-    MV W0, #8       ; 2 instructions offset 
+    MV W0, #8       ; 2 instructions offset
 
     MV ESR, #48     ; enable interruptions and mmu
     ADD EPC, PC, W0 ; the infinite loop below
@@ -122,7 +144,7 @@ exception_supervisor:
     MV K1 #30
     SHL K1 K0 K1          ; K1 = 3 << 30 = 3GB
 
-    MV K0 #0x201C
+    MV K0 #0x401C
     ADD K1 K1 K0 ; k1 points to scratch_space_0
     STORE W0 K1 ; saves w0 in scratch_space_0
 
@@ -138,7 +160,7 @@ exception_supervisor:
     MV W1 #30
     SHL K0 W0 W1 ; K0 = 3GB
 
-    MV W1 #0x2010 ; 
+    MV W1 #0x4010 ; 
     ADD W1 K0 W1 ;
     LOAD W1 W1 ; w1 = running_pid 
 
@@ -155,7 +177,7 @@ exception_supervisor:
     ADD W0 W0 K1          ; W0 = 0x300050 = 3145808 (3MB + 80)
     MUL W1 W1 W0 ; W1 = RUNNING_PID * pcb_size
 
-    MV W0 #0x2024 ; 
+    MV W0 #0x4024 ; 
     ADD W0 K0 W0 ; w0 = pcb_v_addr
     ADD W0 W0 W1 ; W0 = pcb[RUNNING_PID] address
 
@@ -200,16 +222,16 @@ exception_supervisor:
     MV W3 #48
     SUB W0 W0 W3 ; w0 points to pcb[RUNNING_PID].w0
 
-    MV W2 #0x201C
-    ADD W2 W2 K0          ; w2 = 3GB + 0x201C = scratch_space_0
+    MV W2 #0x401C
+    ADD W2 W2 K0          ; w2 = 3GB + 0x401C = scratch_space_0
     LOAD W2 W2            ; w2 = w0 salvo
     STORE W2 W0           ; pcb[running_pid].w0 = w0
 
     MV W8 #4
     ADD W0 W0 W8 ; w0 points to pcb[RUNNING_PID].w1
 
-    MV W2 #0x2020
-    ADD W2 W2 K0          ; w2 = 3GB + 0x2020 = scratch_space_1
+    MV W2 #0x4020
+    ADD W2 W2 K0          ; w2 = 3GB + 0x4020 = scratch_space_1
     LOAD W2 W2            ; w2 = w1 salvo
     STORE W2 W0           ; pcb[running_pid].w1 = w1
 
@@ -249,14 +271,14 @@ clock_int:
   MV K1, #30
   SHL K0, K0, K1                    ; K0 = 3GB kernel offset
 
-  MV K1, #0x2014
+  MV K1, #0x4014
   ADD K1, K1, K0                     ; k1 = clock_interrupt_count address
   LOAD W0, K1                        ; w0 = clock_interrupt_count
 
   MV W1, #1
   ADD W0, W0, W1                    ; clock_interrupt_count += 1
 
-  MV W1, #0x2004
+  MV W1, #0x4004
   ADD W1, W1, K0      ; W1 = time_slice address
   LOAD W1, W1         ; W1 = time_slice 
   CMP W0, W1
@@ -265,11 +287,11 @@ clock_int:
 
     STORE W0, K1              ; clock_interrupt_count
   clock_return:
-    MV W0, #0x201C
+    MV W0, #0x401C
     ADD W0, W0, K0            ; W0 = scratch_space_0 addr
     LOAD W0, W0               ; scratch_space_0
 
-    MV W1, #0x2020
+    MV W1, #0x4020
     ADD W1, W1, K0            ; W1 = scratch_space_0 addr
     LOAD W1, W1               ; scratch_space_1
     MRET
@@ -278,7 +300,7 @@ clock_int:
     MV W0, #0
     STORE W0, K1       ; clock_interrupt_count = 0
 
-  MV K1, #0x2010
+  MV K1, #0x4010
   ADD K1, K1, K0       ; K1 = running_pid addr
 
   LOAD W0, K1          ; running_pid
@@ -295,7 +317,7 @@ clock_int:
   LOAD W1, K1         ; running_pid    
   MUL W1, W0, W1      ; W1 = running_pid * pcb_size
   
-  MV W0, #0x2024
+  MV W0, #0x4024
   ADD W0, W0, K0      ; W0 = pcb_v address
   
   ADD W1, W0, W1      ; W1 = pcb_v[running_pid] initial address
@@ -335,13 +357,13 @@ clock_int:
   SUB W1, W1, W0
   STORE W2, W1                    ; saving W2
 
-  MV W3, #0x2020
+  MV W3, #0x4020
   ADD W3, W3, K0           ; W3 = scratch_space_1 address
   LOAD W3, W3              ; W3 = scratch_space_1
   SUB W1, W1, W0
   STORE W3, W1                    ; saving W1
 
-  MV W3, #0x201C
+  MV W3, #0x401C
   ADD W3, W3, K0           ; W3 = scratch_space_0 address
   LOAD W3, W3              ; W3 = scratch_space_0
   SUB W1, W1, W0
@@ -360,7 +382,7 @@ input_int:
     ; BUFFER_START = VIRTUAL_MEMORY_LIMIT - BUFFER_SIZE
     MV W3, #0                      ; W3 = VIRTUAL_MEMORY_LIMIT
 
-    MV W2, #0x2008
+    MV W2, #0x4008
     ADD W2, K0, W2
     LOAD W2, W2                      ; W2 = BUFFER_SIZE
 
@@ -368,14 +390,14 @@ input_int:
     LOAD W3, W3                      ; W3 = buffer_input_size (first 4 bytes of buffer)
 
     ; Save buffer_input_size to scratch_space_0 for later use
-    MV W1, #0x201C
+    MV W1, #0x401C
     ADD W1, K0, W1
     STORE W3, W1                     ; scratch_space_0 = buffer_input_size
 
     ; Search for a free PCB slot
     ; for pid in range(0, MAX_PROCESSES)
     MV W4, #0                        ; W4 = pid = 0
-    MV W5, #0x2000
+    MV W5, #0x4000
     ADD W5, K0, W5
     LOAD W5, W5                      ; W5 = MAX_PROCESSES
 
@@ -392,8 +414,8 @@ input_int:
 
         ; Compute &pcb_v[pid]
         MUL W1, W4, W0               ; W1 = pid * pcb_size
-        MV W8, #0x2024
-        ADD W0, K0, W8               ; W0 = 0xC0002024 (pcb_v virtual base address)
+        MV W8, #0x4024
+        ADD W0, K0, W8               ; W0 = 0xC0004024 (pcb_v virtual base address)
         ADD W0, W0, W1               ; W0 = &pcb_v[pid] (virtual address)
 
         ; Read flags at offset 72
@@ -518,7 +540,7 @@ input_int:
 
         ; Map pages for the program code
 
-        MV W3, #0x201C
+        MV W3, #0x401C
         ADD W3, K0, W3
         LOAD W3, W3                    ; W3 = buffer_input_size
 
@@ -528,7 +550,7 @@ input_int:
         UDIV W3, W3, W2                ; W3 = num_pages = ceil(buffer_input_size / 4096)
 
         ; Save pcb_v[pid] base (W0) and pid (W4) to kernel stack
-        MV W1, #0x2018
+        MV W1, #0x4018
         ADD W1, K0, W1
         LOAD SP, W1                    ; SP = kernel_stack_pointer
         MV W1, #4
@@ -603,7 +625,7 @@ input_int:
         ; Copy buffer content to user virtual memory
         MV W3, #0                    ; W3 = virtual_memory_limit
 
-        MV W2, #0x2008
+        MV W2, #0x4008
         ADD W2, K0, W2
         LOAD W2, W2                    ; W2 = BUFFER_SIZE
 
@@ -611,7 +633,7 @@ input_int:
         MV W2, #4
         ADD W3, W3, W2                 ; W3 = buffer data start (skip size word)
 
-        MV W6, #0x201C
+        MV W6, #0x401C
         ADD W6, K0, W6
         LOAD W6, W6                    ; W6 = buffer_input_size
         MV W8, #0                      ; W8 = index = 0 (user virtual address)
@@ -677,7 +699,7 @@ kill_int:
     ; Obtém o início do buffer
     MV W9, #0       ; W9 = virtual_memory_limit
 
-    MV W7, #0x2008  ; #0x2008 BUFFER_SIZE
+    MV W7, #0x4008  ; #0x4008 BUFFER_SIZE
     ADD W7, W7, K0  ; W7 = buffer_size virtual address
     LOAD W7, W7     ; W7 = buffer_Size
     SUB W9, W9, W7  ; W9 = buffer address
@@ -688,7 +710,7 @@ kill_int:
     ADD W9, W9, W6
     LOAD W9, W9
 
-    MV W1, #0x2000 ; MAX_PROCESSES (verifica pid)
+    MV W1, #0x4000 ; MAX_PROCESSES (verifica pid)
     ADD W1, W1, K0 ; W1 = max_processes virtual addr
     LOAD W1, W1    ; W1 = max_processes
 
@@ -707,7 +729,7 @@ kill_int:
     ; &pcb_v[pid]
     MUL W3, W9, W2
 
-    MV  W4, #0x2024 ; #0x2024 pcb_vector physical address
+    MV  W4, #0x4024 ; #0x4024 pcb_vector physical address
     ADD W4, W4, K0  ; W4 = pcb_vector virtual address
     ADD W3, W3, W4
 
@@ -778,13 +800,13 @@ syscall_int:
     MV W1, #0x50
     ADD W0, W0, W1              ; W0 = pcb_size (0x300050)
     
-    MV W8, #0x2010
-    ADD W8, K0, W8              ; W8 = 0xC0002010 (&running_pid)
+    MV W8, #0x4010
+    ADD W8, K0, W8              ; W8 = 0xC0004010 (&running_pid)
     LOAD W1, W8                 ; W1 = running_pid
     MUL W1, W1, W0              ; W1 = running_pid * pcb_size
 
-    MV W8, #0x2024
-    ADD W0, K0, W8              ; W0 = 0xC0002024 (pcb_v base address)
+    MV W8, #0x4024
+    ADD W0, K0, W8              ; W0 = 0xC0004024 (pcb_v base address)
     ADD W0, W0, W1              ; W0 = &pcb_v[running_pid]
 
     MV W3, #56                  ; offset of W9 in PCB
@@ -802,10 +824,10 @@ fault_int:
   MV W7, #30
   SHL W8, W8, W7        ; W8 = 3GB kernel offset
 
-  MV W0, #0x2024        ; pcb_v initial physical address
+  MV W0, #0x4024        ; pcb_v initial physical address
   ADD W0, W0, W8        ; pcb_v initial virtual address
 
-  MV W9, #0x2010        ; running_pid physical address
+  MV W9, #0x4010        ; running_pid physical address
   ADD W9, W9, W8        ; W9 = running_pid virtual address
   LOAD W9, W9           ; W9 = running_pid
 
@@ -871,7 +893,7 @@ page_fault_kill:
     ; ==========================================================
     ; Tratamento de Falha: pcb_v[running_pid].w9 = 3 e kill()
     ; ==========================================================
-    MV W8, #0x2010
+    MV W8, #0x4010
     ADD W8, K0, W8
     LOAD W9, W8      ; W9 = running_pid
 
@@ -883,7 +905,7 @@ page_fault_kill:
 
     MUL W0, W9, W1                 ; W0 = running_pid * pcb_size
     
-    MV W8, #0x2024
+    MV W8, #0x4024
     ADD W1, K0, W8                  ; W1 = pcb_v base
     ADD W0, W0, W1                 ; W0 = endereço de pcb_v[running_pid]
     
@@ -927,7 +949,7 @@ page_fault_restore:
     ; O exception_supervisor já salvou os registradores no PCB antes de chamar essa função.
     ; Precisamos subtrair 4 do PC salvo no PCB (offset 60) para re-executar a instrução.
     
-    MV W8, #0x2010
+    MV W8, #0x4010
     ADD W8, K0, W8
     LOAD W9, W8     ; w9 = running_pid
     
@@ -939,7 +961,7 @@ page_fault_restore:
 
     MUL W0, W9, W1
     
-    MV W8, #0x2024
+    MV W8, #0x4024
     ADD W1, K0, W8                 ; w1 = pcb_v[0]
     ADD W6, W0, W1                 ; W6 = base de pcb_v[running_pid]
 
@@ -977,7 +999,7 @@ fork:
     
     MV W4, #0                        ; W4 = pid = 0
 
-    MV W5, #0x2000
+    MV W5, #0x4000
     ADD W5, K0, W5
     LOAD W5, W5                      ; W5 = MAX_PROCESSES
 
@@ -994,8 +1016,8 @@ fork:
 
         ; Compute &pcb_v[pid]
         MUL W1, W4, W0
-        MV W8, #0x2024
-        ADD W0, K0, W8               ; W0 = 0xC0002024
+        MV W8, #0x4024
+        ADD W0, K0, W8               ; W0 = 0xC0004024
         ADD W0, W0, W1               ; W0 = &pcb_v[pid]
 
         ; Read flags (offset 72)
@@ -1058,13 +1080,13 @@ fork:
         MV W1, #0x50
         ADD W3, W3, W1               ; W3 = pcb_size (0x300050)
         
-        MV W1, #0x2010
+        MV W1, #0x4010
         ADD W1, K0, W1
         LOAD W1, W1                  ; W1 = running_pid
 
         MUL W1, W1, W3
-        MV W8, #0x2024
-        ADD W7, K0, W8               ; W7 = 0xC0002024
+        MV W8, #0x4024
+        ADD W7, K0, W8               ; W7 = 0xC0004024
         ADD W7, W7, W1               ; W7 = &pcb_v[running_pid]
 
         ; Copy registers from parent to child
@@ -1106,8 +1128,8 @@ fork:
         ADD W1, W0, W1                   ; W1 = virtual child pt addr
         SUB W1, W1, W2                   ; W1 = physical child pt addr
         
-        MV W8, #0x2020
-        ADD W8, K0, W8                   ; W8 = 0xC0002020 (&scratch_space_1)
+        MV W8, #0x4020
+        ADD W8, K0, W8                   ; W8 = 0xC0004020 (&scratch_space_1)
         STORE W1, W8                     ; scratch_space_1 = child PT (physical)
         MV UPTR, #0
         ADD UPTR, UPTR, W1               ; UPTR = child PT (physical)
@@ -1117,13 +1139,13 @@ fork:
         ADD W1, W7, W1                   ; W1 = virtual parent pt addr
         SUB W1, W1, W2                   ; W1 = physical parent pt addr
         
-        MV W8, #0x201C
-        ADD W8, K0, W8                   ; W8 = 0xC000201C (&scratch_space_0)
+        MV W8, #0x401C
+        ADD W8, K0, W8                   ; W8 = 0xC000401C (&scratch_space_0)
         STORE W1, W8                     ; scratch_space_0 = parent PT (physical)
 
         ; Save child PCB (W0), pid (W4), parent PCB (W7) to kernel stack
-        MV W8, #0x2018
-        ADD W8, K0, W8                   ; W8 = 0xC0002018 (&kernel_stack_pointer)
+        MV W8, #0x4018
+        ADD W8, K0, W8                   ; W8 = 0xC0004018 (&kernel_stack_pointer)
         LOAD SP, W8                      ; SP = kernel_stack_pointer
 
         MV W1, #4
@@ -1140,8 +1162,8 @@ fork:
         MUL W3, W3, W1               ; W3 = 786432
 
         ; W6 = physical parent PT base addr
-        MV W8, #0x201C
-        ADD W8, K0, W8               ; W8 = 0xC000201C (&scratch_space_0)
+        MV W8, #0x401C
+        ADD W8, K0, W8               ; W8 = 0xC000401C (&scratch_space_0)
         LOAD W6, W8                  ; W6 = physical parent PT base addr
         ADD W6, W6, W2               ; W6 = virtual parent PT base addr
 
@@ -1176,7 +1198,7 @@ fork:
         STORE W2, SP
 
         ; Set UPTR to child PT for map_page to map into child's table
-        MV W8, #0x2020
+        MV W8, #0x4020
         ADD W8, K0, W8
         LOAD UPTR, W8                    ; UPTR = child PT (physical)
 
@@ -1256,13 +1278,13 @@ fork:
         ADD W8, W9, W2
 
         ; Switch UPTR to parent -> read
-        MV W7, #0x201C
+        MV W7, #0x401C
         ADD W7, K0, W7
         LOAD UPTR, W7                 ; UPTR = parent PT (physical)
         LOAD W5, W8                   ; W5 = parent_page[offset]
 
         ; Switch UPTR to child -> write
-        MV W7, #0x2020
+        MV W7, #0x4020
         ADD W7, K0, W7
         LOAD UPTR, W7                 ; UPTR = child PT (physical)
         STORE W5, W8                  ; child_page[offset] = W5
@@ -1307,7 +1329,7 @@ fork:
         STORE W1, W8                  ; child gets -2
 
         ; parent_pid = running_pid (offset 0)
-        MV W8, #0x2010
+        MV W8, #0x4010
         ADD W8, K0, W8
         LOAD W5, W8                  ; W5 = running_pid
         STORE W5, W0
@@ -1334,8 +1356,8 @@ fork:
             MV W0, #0x50
             ADD W3, W3, W0            ; W3 = pcb_size (0x300050)
             MUL W1, W1, W3
-            MV W8, #0x2024
-            ADD W3, K0, W8            ; W3 = 0xC0002024 (&pcb_v[0] virtual)
+            MV W8, #0x4024
+            ADD W3, K0, W8            ; W3 = 0xC0004024 (&pcb_v[0] virtual)
             ADD W1, W1, W3            ; W1 = &pcb_v[old_child] (virtual address)
 
             MV W3, #8
@@ -1363,12 +1385,12 @@ fork:
         MV W1, #0x50
         ADD W0, W0, W1               ; W0 = pcb_size (0x300050)
         
-        MV W1, #0x2010
+        MV W1, #0x4010
         ADD W1, W1, K0     ; W1 = running_pid virtual address
         LOAD W1, W1        ; W1 = running_pid
 
         MUL W1, W1, W0
-        MV W0, #0x2024               ; W0 = pcb_v physical address
+        MV W0, #0x4024               ; W0 = pcb_v physical address
         ADD W0, W0, W1               ; &pcb_v[running_pid] physical address
         ADD W0, W0, K0               ; W0 = pcb_v[running_pid] virtual address
 
@@ -1383,7 +1405,7 @@ wait:
     MV K1, #30
     SHL K0, K0, K1      ; K0 = 3GB kernel offset
 
-    MV W8, #0x2024
+    MV W8, #0x4024
     ADD W0, K0, W8                ; W0 points to pcb_v first byte
     MV W8 #52 
     ADD W0, W0, W8 ; w0 points to pcb_v[0].w8
@@ -1394,7 +1416,7 @@ wait:
     MV W8, #0x50
     ADD K1, K1, W8 ; K1 = bytes size of each pcb
 
-    MV W2, #0x2010
+    MV W2, #0x4010
     ADD W2, K0, W2
     LOAD W1, W2  ; W1 = running_pid
     MUL W1 W1 K1 ; W1 = RUNNING_PID * pcb_size bytes
@@ -1452,7 +1474,7 @@ status_addr_check:
 
     wait_skip_no_child:
     LOAD W3 W2 ; w3 = curr_child = pcb_v[running_pid].childPID
-    MV W8, #0x2024
+    MV W8, #0x4024
     ADD W0, K0, W8                ; W0 = pcb_v base
 
 ; w0 points to pcb_v[0] first byte
@@ -1607,7 +1629,7 @@ exit:
     MV W7, #16                 ; W7 = shift amount
     SHL W6, W6, W7            ; W6 = 0xC0000000 (kernel boundary)
 
-    MV W5, #0x2010             ; #0x2010 running_pid
+    MV W5, #0x4010             ; #0x4010 running_pid
     ADD W5, W6, W5            ; W5 = running_pid virtual address
     LOAD W9, W5               ; W9 = running_pid
 
@@ -1620,7 +1642,7 @@ exit:
 
     MUL W0, W9, W1             ; W0 = running_pid * pcb_size
 
-    MV W1, #0x2024             ; #0x2024 pcb_vector
+    MV W1, #0x4024             ; #0x4024 pcb_vector
     ADD W1, W6, W1             ; W1 = pcb_v virtual initial address
     ADD W0, W0, W1             ; W0 = pcb_v[running_pid] initial address
 
@@ -1636,11 +1658,11 @@ exit:
 
 
 getPID:
-    MV W2, #0x2010
+    MV W2, #0x4010
     ADD W2, K0, W2
     LOAD W0, W2    ; W0 = running_pid
     
-    MV W8, #0x2024
+    MV W8, #0x4024
     ADD W1, K0, W8                ; W1 = pcb_v base
 
     MV W8, #0x30
@@ -1675,7 +1697,7 @@ kill:
   MV W1, #16
   SHL K0, K0, W1
 
-  MV W0, #0x2024          ; #0x2024 pcb_vector
+  MV W0, #0x4024          ; #0x4024 pcb_vector
   ADD W0, K0, W0          ; W0 = pcb_v virtual initial address
 
   MV W1, #0x30
@@ -1840,11 +1862,13 @@ kill:
 
 
   orphanize_end:
-    MV W0, #0x3010
+    ; MV sign-extends #0x9024 to 0xFFFF9024 (-0x6FDC), so the high half is
+    ; 0x3011, not 0x3010: 0x30110000 - 0x6FDC = 0x30109024. Do not "fix" it.
+    MV W0, #0x3011
     MV W1, #16
     SHL W0, W0, W1
-    MV W1, #0x7024
-    ADD W0, W0, W1      ; W0 = #0x30107024 bitmap physical address
+    MV W1, #0x9024
+    ADD W0, W0, W1      ; W0 = 0x30109024 bitmap physical address
 
     ADD W0, K0, W0      ; W0 = bitmap virtual address
 
@@ -1965,7 +1989,7 @@ schedule:
 
     ; clock_interrupt_count = 0
 
-    MV W0, #0x2014 ; #0x2014 clock_interrupt_count
+    MV W0, #0x4014 ; #0x4014 clock_interrupt_count
     ADD W0, W8, W0
 
     MV W5, #0
@@ -1973,7 +1997,7 @@ schedule:
 
     ; W7 = MAX_PROCESSES
 
-    MV W0, #0x2000 ; #0x2000 MAX_PROCESSES
+    MV W0, #0x4000 ; #0x4000 MAX_PROCESSES
     ADD W0, W8, W0
     LOAD W7, W0
 
@@ -1989,7 +2013,7 @@ schedule:
     ; if running_pid >= MAX_PROCESSES:
     ;     running_pid = 0
 
-    MV W0, #0x2010 ; #0x2010 running_pid
+    MV W0, #0x4010 ; #0x4010 running_pid
     ADD W0, W8, W0
     LOAD W9, W0
 
@@ -2009,7 +2033,7 @@ schedule:
     schedule_check_current_process:
     MUL W1, W9, W6
 
-    MV W0, #0x2024 ; #0x2024 pcb_vector
+    MV W0, #0x4024 ; #0x4024 pcb_vector
     ADD W0, W8, W0
     ADD W1, W0, W1
 
@@ -2074,7 +2098,7 @@ schedule:
 
     MUL W1, W4, W6
 
-    MV W0, #0x2024 ; #0x2024 pcb_vector
+    MV W0, #0x4024 ; #0x4024 pcb_vector
     ADD W0, W8, W0
     ADD W1, W0, W1
 
@@ -2137,7 +2161,7 @@ schedule:
     MV W9, #0
     ADD W9, W9, W4
 
-    MV W0, #0x2010 ; #0x2010 running_pid
+    MV W0, #0x4010 ; #0x4010 running_pid
     ADD W0, W8, W0
     STORE W9, W0
 
@@ -2168,7 +2192,7 @@ schedule:
     ADD W0, W1, W0
     LOAD W5, W0              
 
-    MV W0, #0x201C ; #0x201C scratch_space_0
+    MV W0, #0x401C ; #0x401C scratch_space_0
     ADD W0, W8, W0
     STORE W5, W0
 
@@ -2179,7 +2203,7 @@ schedule:
     ADD W0, W1, W0
     LOAD W5, W0              
 
-    MV W0, #0x2020 ; #0x2020 scratch_space_1
+    MV W0, #0x4020 ; #0x4020 scratch_space_1
     ADD W0, W8, W0
     STORE W5, W0
 
@@ -2269,12 +2293,12 @@ schedule:
 
 
 
-    MV W1, #0x201C ; #0x201C scratch_space_0
+    MV W1, #0x401C ; #0x401C scratch_space_0
     ADD W1, W8, W1
     LOAD W1, W1
 
 
-    MV K0, #0x2020      ; K0 = scratch_space_1 virtual address
+    MV K0, #0x4020      ; K0 = scratch_space_1 virtual address
     ADD W8, W8, K0      ; W8 = scratch_space_1 physical address
     LOAD W8, W8
 
@@ -2321,7 +2345,7 @@ schedule:
 
     MV W9, #-1
 
-    MV W0, #0x2010 ; #0x2010 running_pid
+    MV W0, #0x4010 ; #0x4010 running_pid
     ADD W0, W8, W0
     STORE W9, W0
 
@@ -2336,18 +2360,20 @@ loop:
 
 
 map_page:
-  MV W0, #0x3010
+  ; MV sign-extends #0x9024 to 0xFFFF9024 (-0x6FDC), so the high half is
+  ; 0x3011, not 0x3010: 0x30110000 - 0x6FDC = 0x30109024. Do not "fix" it.
+  MV W0, #0x3011
   MV W1, #16
   SHL W0, W0, W1
-  MV W1, #0x7024
-  ADD W0, W0, W1       ; W0 = bitmap physical address
+  MV W1, #0x9024
+  ADD W0, W0, W1       ; W0 = 0x30109024 = bitmap physical address
 
   MV K0, #3
   MV K1, #30
   SHL K0, K0, K1       ; K0 = 3GB kernel boundary
   ADD W0, W0, K0       ; W0 = bitmap virtual address
 
-  MV W1, #0x200C       ; #0x200C memory_size
+  MV W1, #0x400C       ; #0x400C memory_size
   ADD W1, W1, K0       ; W1 = memory_size virtual address
   LOAD W1, W1          ; W1 = memory_size
 

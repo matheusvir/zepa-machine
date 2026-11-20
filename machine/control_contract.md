@@ -3,9 +3,11 @@
 This document and the declarations in `kernel_layout.go` and
 `control_contract.go` are definitions only. They do not implement a loader,
 queue, controller, image store, init/exec service, handler, or operational
-stub. The addresses are the planned layout, not a claim that the existing
-kernel or debugger has migrated to it. This contract is scoped to F2-01 issue
-#17; it does not replace the project's syscall/argv source of truth.
+stub. The physical layout below is in use: the Go host and debugger (F2-05)
+and the ASM kernel (F2-06) address it. The control-map protocol beyond the
+kernel status record is still a definition only. This contract is scoped to
+F2-01 issue #17; it does not replace the project's syscall/argv source of
+truth.
 
 ## Physical layout and identities
 
@@ -36,17 +38,22 @@ child 4, previous sibling 8, next sibling 12, status address 16, W0–W9
 
 The nine global words, in order, are max-processes, time-slice, buffer-size,
 memory-size, running PID, clock count, kernel SP, scratch0, scratch1, at
-`0x4000` through `0x4020` in four-byte increments. The old addresses in
-`kernel.asm`, `debug.go`, `main_kernel.go`, and
-`abstract_implementation.md` are downstream migration dependencies; this
-definition does not edit or activate those consumers.
+`0x4000` through `0x4020` in four-byte increments. Every consumer that used
+the predecessor addresses has migrated:
 
-| Existing consumer | Existing assumption to migrate in a later issue |
+| Consumer | Status |
 |---|---|
-| `sackOS/kernel.asm` | PCB base `0x2024`, KPTR `0x30007024`, bitmap derived from old KPTR; initial SP is `0x00000000 - BUFFER_SIZE` (virtual `0xFFFF0000` for 64 KiB), not the new stack top `0xFFFD0000`. |
-| `machine/debug.go` | PCB base `0x2024`, KPTR `0x30007024`, bitmap `0x30107024`; PCB stride/field offsets stay the same. |
-| `main_kernel.go` | Initializes nine-globals predecessor addresses `0x2000`, `0x2004`, `0x2008` and accepts physical backing from 1 GiB + 4 KiB through 4 GiB. |
-| `sackOS/abstract_implementation.md` | Documents globals `0x2000..0x2020`, PCB base `0x2024`, KPTR `0x30007024`, bitmap `0x30107024`. |
+| `sackOS/kernel.asm` | Migrated (F2-06). Globals `0x4000..0x4020`, PCB base `0x4024`, KPTR `0x30009024`, bitmap `0x30109024`; the KPTR and bitmap constructions use a `+1` high half because `MV` sign-extends the low half `0x9024`. Kernel SP top is the constant `0xFFFD0000`, independent of `BUFFER_SIZE`. Setup publishes the status record last. |
+| `machine/debug.go` | Migrated (F2-05). Reads globals, PCBs, KPTR and bitmap through `GlobalAddress`/`PCBAddress` and the layout constants; PCB stride/field offsets are unchanged. |
+| `main_kernel.go` | Migrated (F2-05). Initializes max-processes, time-slice and buffer-size at `0x4000`, `0x4004`, `0x4008`; still accepts physical backing from 1 GiB + 4 KiB through 4 GiB. |
+| `sackOS/abstract_implementation.md` | Migrated (F2-06). Documents this layout, the kernel stack reservation and the readiness rule. |
+
+The kernel does not yet validate the host bootstrap (magic, version, ready);
+no issue owns that check. Until the host writes its bootstrap (F2-16),
+`ReadControlObservation` classifies the control map after kernel setup as
+`malformed` ("bootstrap is uninitialized while other records are
+populated"), because the kernel status record is populated while the host
+bootstrap is still zero. Before setup it reports `uninitialized`.
 
 `PhysicalAddress`, `VirtualAddress`, `ImageID`, `RequestID`, and
 `PublicationToken` are distinct named uint32 types. Zero is unset/invalid for
