@@ -79,9 +79,11 @@ func TestLifecycleExitOrphanBaseline(t *testing.T) {
 	f.put(p+52, 42)
 	f.put(p+56, 0xabcdef01)
 	f.put(p+72, 9)
-	f.put(p+76, 0) // no allocated user pages in this synthetic PCB
+	f.put(p+76, 0)   // no allocated user pages in this synthetic PCB
+	f.put(0x2000, 1) // page_release validates the PID against max_processes
+	prepareKillCleanup(f, 0)
 	f.m.registers[w9] = 2
-	f.run("syscall_int", "schedule", 500)
+	f.run("syscall_int", "schedule", killCleanupBudget)
 	if got := f.get(p + 56); got != 42 {
 		t.Errorf("exit status=%d, want 42", got)
 	}
