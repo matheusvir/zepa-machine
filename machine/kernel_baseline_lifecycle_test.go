@@ -11,8 +11,8 @@ func TestLifecycleWaitBaseline(t *testing.T) {
 	for _, scenario := range []string{"no child", "live child", "zombie child"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newKernelFixture(t)
-			parent, child := uint32(legacyPCB), uint32(legacyPCB+legacyStride)
-			f.put(0x2010, 0)
+			parent, child := uint32(PCBVectorStart), uint32(PCBVectorStart)+PCBStride
+			f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
 			f.put(parent+52, 0x100) // saved W8: mapped, aligned status address
 			f.put(parent+56, 0xabcdef01)
 			f.put(parent+72, 9)
@@ -72,8 +72,8 @@ func TestLifecycleWaitBaseline(t *testing.T) {
 
 func TestLifecycleExitOrphanBaseline(t *testing.T) {
 	f := newKernelFixture(t)
-	p := uint32(legacyPCB)
-	f.put(0x2010, 0)
+	p := uint32(PCBVectorStart)
+	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
 	f.put(p, ^uint32(0))
 	f.put(p+4, ^uint32(0))
 	f.put(p+52, 42)
@@ -93,10 +93,10 @@ func TestLifecycleExitOrphanBaseline(t *testing.T) {
 func TestLifecycleReleBaseline(t *testing.T) {
 	f := newKernelFixture(t)
 	f.identityPCBPages(0, 1)
-	p := uint32(legacyPCB)
-	next := uint32(legacyPCB + legacyStride)
-	f.put(0x2000, 2)
-	f.put(0x2010, 0)
+	p := uint32(PCBVectorStart)
+	next := uint32(PCBVectorStart) + PCBStride
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 2)
+	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
 	f.put(p+56, 0xabcdef01)
 	f.put(p+72, 1) // mapped and running
 	f.put(next+56, 0x12345678)
@@ -116,7 +116,7 @@ func TestLifecycleReleBaseline(t *testing.T) {
 	if got := f.get(p + 72); got != 9 {
 		t.Errorf("yielding process flags=%#x, want ready", got)
 	}
-	if got := f.get(0x2010); got != 1 {
+	if got := f.get(uint32(GlobalAddress(GlobalRunningPIDOffset))); got != 1 {
 		t.Errorf("scheduled PID=%d, want 1", got)
 	}
 	if got := f.m.registers[pc]; got != 0x100 {

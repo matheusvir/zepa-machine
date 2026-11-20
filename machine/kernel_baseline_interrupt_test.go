@@ -14,7 +14,7 @@ func interruptBuffer(f *kernelFixture, size, value uint32) {
 	f.t.Helper()
 	const buffer = uint32(0x3ffff000)
 	f.mapKernel(buffer)
-	f.put(0x2008, 4096)
+	f.put(uint32(GlobalAddress(GlobalBufferSizeOffset)), 4096)
 	f.put(buffer, size)
 	f.put(buffer+4, value)
 }
@@ -62,12 +62,12 @@ func TestBaselineKillInterruptRejected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newKernelFixture(t)
 			interruptBuffer(f, 4, tc.pid)
-			f.put(0x2000, 1)
-			f.put(legacyPCB+72, tc.flags)
-			f.put(legacyPCB+56, 0x12345678)
+			f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 1)
+			f.put(uint32(PCBVectorStart)+72, tc.flags)
+			f.put(uint32(PCBVectorStart)+56, 0x12345678)
 			f.run("kill_int", "schedule", 200)
-			if got := f.get(legacyPCB + 56); got != 0x12345678 || f.get(legacyPCB+72) != tc.flags {
-				t.Fatalf("rejected kill changed PCB: W9=%#x flags=%#x", got, f.get(legacyPCB+72))
+			if got := f.get(uint32(PCBVectorStart) + 56); got != 0x12345678 || f.get(uint32(PCBVectorStart)+72) != tc.flags {
+				t.Fatalf("rejected kill changed PCB: W9=%#x flags=%#x", got, f.get(uint32(PCBVectorStart)+72))
 			}
 		})
 	}
@@ -76,43 +76,43 @@ func TestBaselineKillInterruptRejected(t *testing.T) {
 func TestBaselineKillInterruptOrphan(t *testing.T) {
 	f := newKernelFixture(t)
 	interruptBuffer(f, 4, 0)
-	f.put(0x2000, 1)
-	f.put(legacyPCB, ^uint32(0))
-	f.put(legacyPCB+4, ^uint32(0))
-	f.put(legacyPCB+72, 9)
-	f.put(legacyPCB+76, 0)
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 1)
+	f.put(uint32(PCBVectorStart), ^uint32(0))
+	f.put(uint32(PCBVectorStart)+4, ^uint32(0))
+	f.put(uint32(PCBVectorStart)+72, 9)
+	f.put(uint32(PCBVectorStart)+76, 0)
 	f.run("kill_int", "schedule", 500)
-	if got := f.get(legacyPCB + 56); got != 2 || f.get(legacyPCB+72) != 8 {
-		t.Fatalf("orphan kill: W9=%#x flags=%#x; want 2 and 8", got, f.get(legacyPCB+72))
+	if got := f.get(uint32(PCBVectorStart) + 56); got != 2 || f.get(uint32(PCBVectorStart)+72) != 8 {
+		t.Fatalf("orphan kill: W9=%#x flags=%#x; want 2 and 8", got, f.get(uint32(PCBVectorStart)+72))
 	}
 }
 
 func TestBaselineKillInterruptZombie(t *testing.T) {
 	f := newKernelFixture(t)
 	interruptBuffer(f, 4, 1)
-	f.put(0x2000, 2)
-	child := uint32(legacyPCB + legacyStride)
-	f.put(legacyPCB+72, 9)
-	f.put(legacyPCB+4, 1)
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 2)
+	child := uint32(PCBVectorStart) + PCBStride
+	f.put(uint32(PCBVectorStart)+72, 9)
+	f.put(uint32(PCBVectorStart)+4, 1)
 	f.put(child, 0)
 	f.put(child+4, ^uint32(0))
 	f.put(child+72, 9)
 	f.put(child+76, 0)
 	f.run("kill_int", "schedule", 500)
-	if f.get(child+56) != 2 || f.get(child+72) != 11 || f.get(legacyPCB+4) != 1 || f.get(legacyPCB+72) != 9 {
-		t.Fatalf("zombie kill: W9=%#x flags=%#x parent child=%d flags=%#x", f.get(child+56), f.get(child+72), f.get(legacyPCB+4), f.get(legacyPCB+72))
+	if f.get(child+56) != 2 || f.get(child+72) != 11 || f.get(uint32(PCBVectorStart)+4) != 1 || f.get(uint32(PCBVectorStart)+72) != 9 {
+		t.Fatalf("zombie kill: W9=%#x flags=%#x parent child=%d flags=%#x", f.get(child+56), f.get(child+72), f.get(uint32(PCBVectorStart)+4), f.get(uint32(PCBVectorStart)+72))
 	}
 }
 
 func TestBaselineInputInterruptNoSlot(t *testing.T) {
 	f := newKernelFixture(t)
 	interruptBuffer(f, 4, 0x12345678)
-	f.put(0x2000, 1)
-	f.put(legacyPCB+72, 9)
-	f.put(legacyPCB+56, 0xabcdef01)
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 1)
+	f.put(uint32(PCBVectorStart)+72, 9)
+	f.put(uint32(PCBVectorStart)+56, 0xabcdef01)
 	f.run("input_int", "schedule", 200)
-	if f.get(legacyPCB+72) != 9 || f.get(legacyPCB+56) != 0xabcdef01 || f.get(0x201c) != 4 {
-		t.Fatalf("full input: flags=%#x W9=%#x size=%d", f.get(legacyPCB+72), f.get(legacyPCB+56), f.get(0x201c))
+	if f.get(uint32(PCBVectorStart)+72) != 9 || f.get(uint32(PCBVectorStart)+56) != 0xabcdef01 || f.get(uint32(GlobalAddress(GlobalScratch0Offset))) != 4 {
+		t.Fatalf("full input: flags=%#x W9=%#x size=%d", f.get(uint32(PCBVectorStart)+72), f.get(uint32(PCBVectorStart)+56), f.get(uint32(GlobalAddress(GlobalScratch0Offset))))
 	}
 }
 
@@ -120,13 +120,10 @@ func TestBaselineInputInterruptLoadsProgram(t *testing.T) {
 	f := newKernelFixture(t)
 	f.identityPCBPages(0, 1)
 	interruptBuffer(f, 4, 0x12345678)
-	const stack = uint32(0x1000000)
-	f.mapKernel(stack)
-	f.put(0x2018, kernelBoundary+stack+pageSize)
-	f.put(0x2000, 2)
-	f.put(legacyPCB+72, 9) // input must skip occupied PID 0
-	f.put(legacyPCB+56, 0xabcdef01)
-	child := uint32(legacyPCB + legacyStride)
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 2)
+	f.put(uint32(PCBVectorStart)+72, 9) // input must skip occupied PID 0
+	f.put(uint32(PCBVectorStart)+56, 0xabcdef01)
+	child := uint32(PCBVectorStart) + PCBStride
 	f.initBitmap()
 	f.run("input_int", "schedule", 100000)
 	for off := uint32(0); off <= 16; off += 4 {
@@ -148,7 +145,7 @@ func TestBaselineInputInterruptLoadsProgram(t *testing.T) {
 		t.Fatalf("invalid input PTE %#x", pte)
 	}
 	frameID := frame / pageSize
-	bitmapWord := f.get(legacyBitmap + (frameID/32)*4)
+	bitmapWord := f.get(uint32(BitmapStart) + (frameID/32)*4)
 	if bitmapWord&(1<<(frameID%32)) == 0 {
 		t.Fatalf("input frame %d not marked allocated in bitmap word %#x", frameID, bitmapWord)
 	}
@@ -160,7 +157,7 @@ func TestBaselineInputInterruptLoadsProgram(t *testing.T) {
 			t.Fatalf("input padding byte %d = %#x", i+4, b)
 		}
 	}
-	if f.get(legacyPCB+56) != 0xabcdef01 || f.get(legacyPCB+72) != 9 {
+	if f.get(uint32(PCBVectorStart)+56) != 0xabcdef01 || f.get(uint32(PCBVectorStart)+72) != 9 {
 		t.Fatal("input modified occupied PCB")
 	}
 }
