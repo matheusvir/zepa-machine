@@ -497,9 +497,12 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 	stack := trackKernelStack(s, kernelBoundary+r.k.label(t, "schedule"))
 
 	// Input interrupt from the idle loop, raised as Boot raises it.
-	if !m.LoadBuffer(sample) {
-		t.Fatal("LoadBuffer rejected the sample")
+	if len(sample) > bufferSize-4 {
+		t.Fatal("sample does not fit the transfer buffer")
 	}
+	// The test raises the interrupt itself, so it writes the buffer directly
+	// instead of going through the safe-point request path.
+	m.writeTransferBufferLocked(sample)
 	m.exception(inputInt)
 	stack.begin()
 	s.run("input_int", asmHandlerBudget, func(Instruction, uint32) bool { return !m.isKernelMode() })
@@ -555,9 +558,7 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 
 	// Kill interrupt for PID 0 while it is running.
 	pid := make([]byte, 4)
-	if !m.LoadBuffer(pid) {
-		t.Fatal("LoadBuffer rejected the PID")
-	}
+	m.writeTransferBufferLocked(pid)
 	m.exception(killInt)
 	loop := kernelBoundary + r.k.label(t, "loop")
 	stack.begin()
