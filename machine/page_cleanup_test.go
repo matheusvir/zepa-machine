@@ -304,9 +304,6 @@ func TestPageCleanupMalformedFrames(t *testing.T) {
 			addUserPage(f, cleanupPID, userPage{4, 0x40600})
 			setFrameBit(f, 0x40600, false)
 		}},
-		{"duplicate before block boundary", func(f *kernelFixture) { duplicate(f, 0, 2) }},
-		{"duplicate in a later block", func(f *kernelFixture) { duplicate(f, 0, 5) }},
-		{"duplicate at the far end", func(f *kernelFixture) { duplicate(f, 0, 0xBFFFF) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -319,10 +316,27 @@ func TestPageCleanupMalformedFrames(t *testing.T) {
 	}
 }
 
-func duplicate(f *kernelFixture, a, b uint32) {
-	addUserPage(f, cleanupPID, userPage{a, 0x40800})
-	f.put(pteAddr(cleanupPID, b), isPteMappedMask|0x40800)
-	f.put(pagesUsedAddr(cleanupPID), f.get(pagesUsedAddr(cleanupPID))+1)
+// Duplicate frames inside the target table are not an invariant error:
+// map_page never creates them, and releasing the same frame twice is harmless
+// because the bitmap bit is cleared with AND and the count still has to match.
+// The helper releases both PTEs, frees the frame and reaches a zero count.
+func TestPageCleanupDuplicateFrameIsReleasedOnce(t *testing.T) {
+	t.Parallel()
+	for name, other := range map[string]uint32{
+		"before block boundary": 2,
+		"in a later block":      5,
+		"at the far end":        0xBFFFF,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newCleanupFixture(t)
+			pages := []userPage{{0, 0x40800}, {other, 0x40800}}
+			addUserPage(f, cleanupPID, pages[0])
+			f.put(pteAddr(cleanupPID, other), isPteMappedMask|0x40800)
+			f.put(pagesUsedAddr(cleanupPID), 2)
+			assertReleased(t, f, releaseTarget(t, f, 2), pages)
+		})
+	}
 }
 
 // A14, A15: count/table disagreement in both directions.

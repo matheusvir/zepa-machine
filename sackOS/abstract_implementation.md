@@ -321,9 +321,10 @@ in total, descending); every return pops the same 48 bytes.
 Traversal: both phases walk the table in blocks of 4 PTEs from both ends (low
 block [low, low+3], high block [high-3, high]). Because the table has
 0xC0000 = 8 * 0x18000 entries, the two blocks never overlap and the pointers
-cross exactly, so every PTE is visited once per phase. A block is skipped when
-the OR of its 4 PTEs has no valid bit; otherwise its entries are handled one by
-one. The alias scan skips blocks the same way.
+cross exactly, so every PTE is visited at most once per phase. A block is
+skipped when the OR of its 4 PTEs has no valid bit; otherwise its entries are
+handled one by one. Phase 1 always walks the whole table; phase 2 stops as soon
+as the remaining count is 0.
 ```
 if pcb is not the exact base of a slot < min(MAX_PROCESSES, 256)
    or page_table != pcb + 80:
@@ -343,11 +344,11 @@ check(i): if pte[i] is valid:
   if frame >= frame_count (memory_size / 4KB, 0 means 4GB): return 5
   if frame < 0x40000 (reserved, covers every kernel mapping): return 5
   if bitmap[frame] == 0 (already free): return 5
-  if some pte[j], j > i, is valid with the same frame (alias): return 5
 
 if valid != pages_used: return 5     // both directions, also 0 with valid PTEs
 
-// phase 2: release, same bounded block traversal
+// phase 2: release, same bounded block traversal, stopped when pages_used == 0
+while low <= high and pages_used != 0: ...
 release(i): if pte[i] is valid:
   if pages_used == 0: return 5       // unexpected after preflight, no underflow
   bitmap[frame] &= ~(1 << bit)        // clears only this bit
@@ -358,9 +359,17 @@ if pages_used != 0: return 5
 return 0
 ```
 A detected failure in phase 1 leaves PTEs, bitmap and pages_used unchanged.
-Frames shared with another process are not detected: the allocator never
-creates them (map_page only hands out free frames and fork copies user pages).
-The alias check costs at most pages_used * 0xC0000 extra PTE reads.
+Duplicate frames are not detected, neither inside the target table nor
+shared with another process: the allocator never creates them (map_page only
+hands out free frames and fork copies user pages), and releasing the same
+frame twice inside one table is harmless (the AND clear is idempotent and the
+count check still applies). This follows xv6 (`kernel/vm.c:uvmunmap`), which
+trusts the allocator and only panics on an unmapped entry.
+
+Cost: phase 1 reads the whole 0xC0000-entry table (about 3.1 million
+instructions), independently of the number of pages. Phase 2 stops at the last
+valid PTE, so it only reaches the middle of the table when a page lives there
+(about 3.4 million more in that worst case).
 
 ## schedule()
 ```

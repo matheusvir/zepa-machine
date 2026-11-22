@@ -2444,7 +2444,7 @@ map_page:
 ;   SP+4  bitmap kernel virtual address
 ;   SP+8  address of target pages_used (PCB + 76)
 ;   SP+12 return address of page_release_check4 / page_release_one4
-;   SP+16 W3 spill during the alias scan
+;   SP+16 unused (kept so the frame size stays 48 bytes)
 ;   SP+20 K1, SP+24 K0, SP+28 W4, SP+32 W3, SP+36 W2, SP+40 W1, SP+44 W0
 ; Working registers: W0 = table base, W1 = low block address,
 ;   W2 = high block top address, W3 = valid count (phase 1) / remaining
@@ -2455,8 +2455,16 @@ map_page:
 ; The low block is [W1, W1+12], the high block is [W2-12, W2]. The table has
 ; 0xC0000 = 8 * 0x18000 entries, so the two blocks never overlap and the
 ; pointers cross exactly (W1 > W2) after 0x18000 iterations: every PTE is
-; visited once per phase. A block whose OR has no valid bit is skipped; only
-; blocks containing a valid PTE are examined entry by entry.
+; visited at most once per phase. A block whose OR has no valid bit is skipped;
+; only blocks containing a valid PTE are examined entry by entry.
+; Phase 1 always walks the whole table, because a count that is lower than the
+; number of valid PTEs can only be detected there. Phase 2 stops as soon as the
+; remaining count is 0: phase 1 already proved that no valid PTE is left, so
+; its cost does not depend on the number of pages.
+; Duplicate frames inside the table are not checked: map_page only hands out
+; free frames, and releasing the same frame twice is harmless (the AND clear is
+; idempotent and the count check still applies). Like xv6 uvmunmap, the helper
+; trusts the allocator for this and checks only what can corrupt other owners.
 ; ---------------------------------------------------------------------------
 page_release:
   MV W9, #4
@@ -2638,6 +2646,9 @@ page_release:
   MV W9, #4               ; W4 still holds the valid-bit mask
 
   page_release_rel_loop:
+    MV W5, #0
+    CMP W3, W5
+    BEQ page_release_rel_done   ; count is 0: phase 1 proved no valid PTE is left
     CMP W1, W2
     BGT page_release_rel_done
 
@@ -2786,7 +2797,7 @@ page_release_block_return:
 
 ; page_release_check: phase-1 check of one PTE (read-only).
 ; In: W5 = PTE address, K1 = return address. W5 is preserved on return.
-; Uses W4, W6, W7, W9 and SP+0, SP+16.
+; Uses W4, W6, W7, W9 and SP+0.
 ; Valid PTE: W3 += 1 and frame checks; any violation jumps to page_release_fail.
 page_release_check:
   LOAD W6, W5
@@ -2838,108 +2849,8 @@ page_release_check:
   BEQ #2
   JUMP page_release_fail  ; frame already free in the bitmap
 
-  ; alias: no later valid PTE of this table may map the same frame.
-  ; W3 is spilled so it can hold the valid-bit mask for block skipping.
-  MV W9, #16
-  ADD W9, SP, W9
-  STORE W3, W9            ; SP+16 = valid count
-  MV W3, #1
-  MV W9, #20
-  SHL W3, W3, W9          ; W3 = valid-bit mask
-  MV W4, #0x30
-  MV W9, #16
-  SHL W4, W4, W9
-  ADD W4, W0, W4          ; W4 = table end (exclusive)
-  LOAD W5, SP             ; W5 = address of this PTE
-
-  page_release_alias_head:        ; single entries until a 16-byte block boundary
-    MV W7, #4
-    ADD W5, W5, W7
-    CMP W5, W4
-    BLT #2
-    JUMP page_release_alias_end   ; end of table: no alias
-    SUB W7, W5, W0
-    MV W9, #15
-    AND W7, W7, W9
-    MV W9, #0
-    CMP W7, W9
-    BEQ page_release_alias_block  ; aligned to a block of 4
-    LOAD W7, W5
-    MV W9, #11
-    SHL W7, W7, W9
-    MV W9, #-11
-    SHL W7, W7, W9        ; valid bit and frame id of the later PTE
-    CMP W7, W6
-    BEQ page_release_fail ; same frame mapped twice
-    JUMP page_release_alias_head
-
-  page_release_alias_block:       ; W5 is block aligned and below the end
-    LOAD W7, W5
-    MV W9, #4
-    ADD W9, W5, W9
-    LOAD W9, W9
-    OR W7, W7, W9
-    MV W9, #8
-    ADD W9, W5, W9
-    LOAD W9, W9
-    OR W7, W7, W9
-    MV W9, #12
-    ADD W9, W5, W9
-    LOAD W9, W9
-    OR W7, W7, W9
-    AND W7, W7, W3
-    CMP W7, W3
-    BEQ page_release_alias_slow   ; the block holds a valid PTE
-
-  page_release_alias_next:
-    MV W9, #16
-    ADD W5, W5, W9
-    CMP W5, W4
-    BLT page_release_alias_block
-
-  page_release_alias_end:
-    MV W9, #16
-    ADD W9, SP, W9
-    LOAD W3, W9           ; restore the valid count
-    LOAD W5, SP           ; restore the PTE address for the caller
-    JMPR K1
-
-  page_release_alias_slow:        ; compare the 4 entries one by one
-    LOAD W7, W5
-    MV W9, #11
-    SHL W7, W7, W9
-    MV W9, #-11
-    SHL W7, W7, W9
-    CMP W7, W6
-    BEQ page_release_fail
-    MV W9, #4
-    ADD W9, W5, W9
-    LOAD W7, W9
-    MV W9, #11
-    SHL W7, W7, W9
-    MV W9, #-11
-    SHL W7, W7, W9
-    CMP W7, W6
-    BEQ page_release_fail
-    MV W9, #8
-    ADD W9, W5, W9
-    LOAD W7, W9
-    MV W9, #11
-    SHL W7, W7, W9
-    MV W9, #-11
-    SHL W7, W7, W9
-    CMP W7, W6
-    BEQ page_release_fail
-    MV W9, #12
-    ADD W9, W5, W9
-    LOAD W7, W9
-    MV W9, #11
-    SHL W7, W7, W9
-    MV W9, #-11
-    SHL W7, W7, W9
-    CMP W7, W6
-    BEQ page_release_fail
-    JUMP page_release_alias_next
+  LOAD W5, SP             ; restore the PTE address for the caller
+  JMPR K1
 
 
 ; page_release_one: phase-2 release of one PTE.
