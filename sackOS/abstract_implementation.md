@@ -2,9 +2,10 @@
 
 ## setup
 ```
-store memory_size
+store memory_size at 0x400C
 
-set UPTR and KPTR
+UPTR = pcb_v[0].page_table (0x4074)
+KPTR = 0x30009024
 
 allocate the first frame to the first page
 allocate all kernel frames to high pages
@@ -16,14 +17,28 @@ MRET
 jump to high addresses
 unmap low pages
 
-populate the first 1GB worth of frames of the bitmap
+populate the first 1GB worth of frames of the bitmap (frames [0, 0x40000) at 0x30109024)
+running_pid = -1
 
-SP = SP_ADDRESS
+SP = kernel_stack_pointer = 0xFFFD0000 // constant kernel stack top, not derived from BUFFER_SIZE
+
+// control status record at 0x3FFD0100 (virtual 0xFFFD0100)
+status.version = 1
+status.phase = 1 // ready
+status.ready = 1 // last store of setup
+
 ESA = EXCEPTION_SUPERVISOR_ADDRESS
 EPC = LOOP ADDRESS
 ESR = 48 //will enable interruptions and MMU
 MRET //go to infinite loop, waiting for exceptions
 ```
+
+### Readiness rule
+Setup publishes kernel readiness in the F2-01 control status record (control `+0x100`, physical `0x3FFD0100`): version `1` at `+0x00`, phase ready (`1`) at `+0x04`, and then ready `1` at `+0x08`. The reserved words `+0x0C..+0x1F` stay zero.
+
+The `ready = 1` store is the last store setup performs. KPTR, the kernel mapping, the first-GiB bitmap reservation, `running_pid`, `memory_size` and `kernel_stack_pointer` already hold their final values, and no instruction between it and setup's final `MRET` stores to memory. A consumer that sees `ready = 1` can rely on all of them.
+
+Setup publishes its status whether or not the host bootstrap is present. It does not read or validate the host bootstrap, and it does not write the bootstrap, descriptor, request, result or event records. Only the kernel writes phase and ready.
 
 # Interruption handlers
 
@@ -338,7 +353,7 @@ jump back to return address
 - **memory_size**: how much memory is there available
 - **running_pid**: PID of the current running process, or -1 if no process is running
 - **clock_interrupt_count**: number of clock interruptions since last scheduler call
-- **kernel_stack_pointer**: points to the current kernel stack
+- **kernel_stack_pointer**: top of the kernel stack, set once by setup to the constant `0xFFFD0000`
 - **scratch_space_0**: aux address to temporarily save W0 on interruptions
 - **scratch_space_1**: aux address to temporarily save W1 on interruptions
 
@@ -385,24 +400,45 @@ Array that will tell whether a page frame is being used or not [2^20 bits = 128 
 Similar to the Xv6 scheduler, the PCB vector is the queue itself, with the scheduler iterating it continuously until it finds a ready process.
 
 # Addresses
-The kernel code has approximately 5KB, for simplicity purposes, there will be 8KB dedicated for the kernel's code. 
-Take caution when using these addresses, when using virutal kernel addresses, these values need to be offset by the user memory size (3 GB).
+These are the F2-01 shared physical addresses (`machine/kernel_layout.go`); the Go host and the debugger use the same values.
+The kernel code is about 6 KB and has a 16 KB reservation, physical `[0x0000, 0x4000)`. No kernel data lives below `0x4000`.
+Take caution when using these addresses: kernel virtual addresses are the physical ones offset by the user memory size (3 GB, `0xC0000000`).
 
 ### Constants (set by the OS developer) (32 bits)
-- **MAX_PROCESSES**: 0x2000
-- **TIME_SLICE**: 0x2004
-- **BUFFER_SIZE**: 0x2008
+- **MAX_PROCESSES**: 0x4000
+- **TIME_SLICE**: 0x4004
+- **BUFFER_SIZE**: 0x4008
 
 ### Singular values (32 bits)
-- **memory_size**: 0x200C
-- **running_pid**: 0x2010
-- **clock_interrupt_count**: 0x2014
-- **kernel_stack_pointer**: 0x2018
-- **scratch_space_0**: 0x201C
-- **scratch_space_1**: 0x2020
+- **memory_size**: 0x400C
+- **running_pid**: 0x4010
+- **clock_interrupt_count**: 0x4014
+- **kernel_stack_pointer**: 0x4018
+- **scratch_space_0**: 0x401C
+- **scratch_space_1**: 0x4020
 
 ### Data Structures
-- **pcb_vector**: 0x2024
-- **kernel_page_table**: 0x30007024
-- **bitmap**: 0x30107024
-(these addresses assume at most 256 processes at a time)
+- **pcb_vector**: 0x4024 (PCB `pid` at `0x4024 + pid * 0x300050`)
+- **kernel_page_table**: 0x30009024 (`0x100000` bytes; maps kernel page `0xC0000 + i` to frame `i` for `i` in `[0, 0x40000)`)
+- **bitmap**: 0x30109024 (frame `f` at word `0x30109024 + (f / 32) * 4`, bit `f % 32`)
+- **kernel stack**: physical `[0x3FFC0000, 0x3FFD0000)`, virtual `[0xFFFC0000, 0xFFFD0000)`, 64 KB
+
+### Kernel stack
+Setup sets `SP` and `kernel_stack_pointer` to the top of the reservation, virtual `0xFFFD0000` (physical `0x3FFD0000`).
+The top is a constant: it does not depend on `BUFFER_SIZE`, which only locates the transfer buffer (`0 - BUFFER_SIZE`, physical `0x3FFF0000` for the 64 KB buffer).
+The stack grows down, away from the control map (`0x3FFD0000`), the image window (`0x3FFE0000`) and the transfer buffer above it.
+Handlers that push load `SP` from `kernel_stack_pointer` and pop everything before they reach the scheduler.
+The measured maximum depth is 24 bytes (6 words) in `fork` and 16 bytes (4 words) in `input_int`. There is no overflow guard; 64 KB leaves ample room.
+
+### Building the addresses in assembly
+Globals and the PCB base fit a 16-bit `MV` immediate (`#0x4000`..`#0x4024`) and are added to the kernel offset.
+The kernel page table and bitmap are built as `MV #high; SHL 16; MV #low; ADD`.
+`MV` sign-extends its immediate, so the low half `#0x9024` loads `0xFFFF9024` (`-0x6FDC`).
+Each construction therefore uses a high half one larger than the address suggests:
+
+| Address | High | Low | Result |
+|---|---|---|---|
+| `0x30009024` (KPTR) | `#0x3001` | `#0x9024` | `0x30010000 - 0x6FDC = 0x30009024` |
+| `0x30109024` (bitmap) | `#0x3011` | `#0x9024` | `0x30110000 - 0x6FDC = 0x30109024` |
+
+Any other low half in `[0x8000, 0xFFFF]` needs the same `+1` on the high half.
