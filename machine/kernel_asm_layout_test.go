@@ -307,10 +307,10 @@ const (
 	asmKernelStackBottom = uint32(KernelStackStart) + KernelVirtualOffset
 	asmStatusAddr        = uint32(ControlRegionStart) + ControlStatusOffset // physical 0x3FFD0100
 	asmHandlerBudget     = 500_000
-	// kill runs page_release over the whole 0xC0000-entry user table before
-	// any lifecycle change; with PID 0's single mapped page it takes about
-	// 10.2 million instructions.
-	asmKillBudget = 20_000_000
+	// kill runs page_release before any lifecycle change: one read-only pass
+	// over the whole 0xC0000-entry user table (about 3.1 million instructions)
+	// and a release pass that stops after PID 0's single page.
+	asmKillBudget = 5_000_000
 )
 
 // asmSetupRun is a machine with the runner's minimum backing on which the real

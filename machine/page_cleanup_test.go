@@ -19,6 +19,7 @@ type cleanupRun struct {
 	saved   map[Register]uint32
 	stores  []memAccess
 	outside []memAccess // PCB-vector accesses other than the target count and table
+	steps   int         // executed instructions until page_release returned
 }
 
 func newCleanupFixture(t *testing.T) *kernelFixture {
@@ -43,7 +44,7 @@ func callPageRelease(t *testing.T, f *kernelFixture, pcbVA, tableVA uint32, budg
 	run.saved = setCallerSentinels(f)
 	f.m.registers[w7], f.m.registers[w6] = pcbVA, tableVA
 	pcb := pcbAddr(cleanupPID)
-	runTraced(f, "page_release", "loop", budget, func(a memAccess) {
+	run.steps = runTraced(f, "page_release", "loop", budget, func(a memAccess) {
 		if a.store {
 			run.stores = append(run.stores, a)
 		}
@@ -336,6 +337,44 @@ func TestPageCleanupDuplicateFrameIsReleasedOnce(t *testing.T) {
 			f.put(pagesUsedAddr(cleanupPID), 2)
 			assertReleased(t, f, releaseTarget(t, f, 2), pages)
 		})
+	}
+}
+
+// Cost bound: phase 1 always reads the whole table, but phase 2 stops once the
+// count is 0, so pages near the ends of the table add only a few hundred
+// instructions each. Before this bound, a 1-page kill took about 10.2 million
+// instructions and every extra page added about 2 million.
+func TestPageCleanupCostDoesNotGrowWithPages(t *testing.T) {
+	t.Parallel()
+	const (
+		fullScan = 3_200_000 // one read-only pass over 0xC0000 PTEs, plus slack
+		perPage  = 1_000     // release of one page found near an end of the table
+		midTable = 7_000_000 // a page in the middle makes phase 2 walk half the table
+	)
+	steps := func(t *testing.T, indices []uint32) int {
+		f := newCleanupFixture(t)
+		var pages []userPage
+		for i, index := range indices {
+			pages = append(pages, userPage{index, firstUserFrame + 0x300 + uint32(i)})
+		}
+		installPages(f, pages)
+		run := releaseTarget(t, f, len(pages))
+		assertReleased(t, f, run, pages)
+		return run.steps
+	}
+	empty := steps(t, nil)
+	one := steps(t, []uint32{0})
+	five := steps(t, []uint32{0, 1, 2, 0xBFFFE, 0xBFFFF})
+	middle := steps(t, []uint32{0x5FFFD})
+	t.Logf("instructions: empty %d, 1 page %d, 5 pages %d, central page %d", empty, one, five, middle)
+	if empty > fullScan || one > fullScan || five > fullScan {
+		t.Errorf("empty/1/5 pages took %d/%d/%d instructions, want <= %d", empty, one, five, fullScan)
+	}
+	if five-empty > 5*perPage {
+		t.Errorf("5 pages cost %d more than an empty table, want <= %d", five-empty, 5*perPage)
+	}
+	if middle > midTable {
+		t.Errorf("central page took %d instructions, want <= %d", middle, midTable)
 	}
 }
 

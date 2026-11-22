@@ -18,10 +18,10 @@ import (
 // at its top (0xFFFD0000), the value setup leaves there.
 const killCleanupStack = uint32(KernelStackEnd) - pageSize
 
-// killCleanupBudget covers both full-table passes of page_release for a
-// target without valid PTEs (about 6.3 million instructions) plus kill and
-// the dispatch around it.
-const killCleanupBudget = 10_000_000
+// killCleanupBudget covers page_release for a target without valid PTEs (one
+// read-only pass over the full table, about 3.1 million instructions; the
+// release pass stops at once) plus kill and the dispatch around it.
+const killCleanupBudget = 5_000_000
 
 const (
 	pcbPagesUsedOffset = 76
