@@ -8,13 +8,11 @@ package machine
 // go test ./machine ./cross-assembler passed; fork.asm/fork_test.asm assembled
 // to 44/76 bytes. The latter compares child W9 to zero although specs.md says -2.
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,65 +38,14 @@ type kernelFixture struct {
 
 func newKernelFixture(t *testing.T) *kernelFixture {
 	t.Helper()
-	src, err := os.ReadFile("../sackOS/kernel.asm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, err := assembler.LoadAssemblyFromReader(strings.NewReader(string(src)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	image, err := assembler.ConvertInstructionsToBinary(parsed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := &kernelFixture{t: t, m: NewMachine(32<<20, false), labels: map[string]uint32{}, pages: map[uint32]uint32{}, next: fixtureFrames}
-	// Duplicate the assembler's documented line handling; independently verify
-	// every label operand against its resolved instruction displacement.
-	type reference struct {
-		ins, arg int
-		name     string
-	}
-	var refs []reference
-	s := bufio.NewScanner(strings.NewReader(string(src)))
-	n := 0
-	for s.Scan() {
-		line := strings.TrimSpace(strings.SplitN(s.Text(), ";", 2)[0])
-		if strings.HasSuffix(line, ":") {
-			name := strings.TrimSuffix(line, ":")
-			if _, ok := f.labels[name]; ok {
-				t.Fatalf("duplicate label %s", name)
-			}
-			f.labels[name] = uint32(n * 4)
-			continue
-		}
-		parts := strings.Fields(strings.ReplaceAll(line, ",", ""))
-		if len(parts) == 0 {
-			continue
-		}
-		for i, part := range parts[1:] {
-			refs = append(refs, reference{n, i + 1, part})
-		}
-		n++
-	}
-	if err := s.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if n != len(parsed) || len(image) != n*4 {
-		t.Fatal("assembler instruction count mismatch")
-	}
-	for _, r := range refs {
-		if target, ok := f.labels[r.name]; ok {
-			want := strconv.Itoa(int(target/4) - r.ins)
-			if parsed[r.ins][r.arg] != want {
-				t.Fatalf("label %s displacement: got %s want %s", r.name, parsed[r.ins][r.arg], want)
-			}
-		}
-	}
-	for off := uint32(0); off < uint32(len(image)); off += pageSize {
+	// The shared scanner also verifies the instruction count and every label
+	// displacement against the assembler output.
+	k := loadASMKernel(t)
+	f := &kernelFixture{t: t, m: NewMachine(32<<20, false), labels: k.labels, pages: map[uint32]uint32{}, next: fixtureFrames}
+	for off := uint32(0); off < uint32(len(k.image)); off += pageSize {
 		f.mapKernel(off)
 	}
-	for i, b := range image {
+	for i, b := range k.image {
 		f.m.memory[f.phys(uint32(i))] = b
 	}
 	f.mapKernel(uint32(KernelGlobalsStart))         // globals and PCB 0
@@ -215,6 +162,28 @@ func (f *kernelFixture) get(addr uint32) uint32 {
 	return binary.LittleEndian.Uint32(f.m.memory[f.phys(addr):])
 }
 
+// runner returns a stepper over the fixture machine. The fixture's
+// translate-free diagnostic stays the single diagnostic implementation, and the
+// pre-step hook preserves the fixture's kernel and page-map checks. escaped is
+// the message used when the PC is below the kernel boundary.
+func (f *kernelFixture) runner(escaped string) *asmStepper {
+	f.t.Helper()
+	s := newASMStepper(f.t, f.m, f.labels)
+	s.diagnose = f.diagnostic
+	s.beforeStep = func(pcValue uint32) string {
+		if pcValue < kernelBoundary {
+			return escaped
+		}
+		if _, ok := f.pages[(pcValue-kernelBoundary)/pageSize]; !ok {
+			return "PC is unmapped"
+		}
+		return ""
+	}
+	return s
+}
+
+// run executes from one label to another, stopping before the until
+// instruction is fetched (label-reached semantics).
 func (f *kernelFixture) run(from, until string, limit int) {
 	f.t.Helper()
 	start, ok := f.labels[from]
@@ -227,36 +196,22 @@ func (f *kernelFixture) run(from, until string, limit int) {
 	}
 	f.phase = from
 	f.m.registers[pc] = kernelBoundary + start
-	for i := 0; i < limit; i++ {
-		current := f.m.registers[pc]
-		if current == kernelBoundary+end {
-			return
-		}
-		if current < kernelBoundary {
-			f.fail("PC escaped kernel")
-		}
-		if _, ok := f.pages[(current-kernelBoundary)/pageSize]; !ok {
-			f.fail("PC is unmapped")
-		}
-		if !f.m.fetch() {
-			f.fail("fetch fault")
-		}
-		inst, ok := f.m.decode()
-		if !ok {
-			f.fail("decode fault")
-		}
-		if f.m.checkIllegalRegisterAccess(inst) || f.m.checkIllegalInstruction(inst) {
-			f.fail("illegal instruction or register access")
-		}
-		f.m.execute(inst)
+	if start == end {
+		return
+	}
+	s := f.runner("PC escaped kernel")
+	s.onStep = append(s.onStep, func(Instruction, uint32) {
 		if f.m.registers[pc] < kernelBoundary {
 			f.fail("exception or PC escaped kernel")
 		}
-	}
-	f.fail(fmt.Sprintf("step budget %d exhausted", limit))
+	})
+	s.run(from, limit, func(Instruction, uint32) bool {
+		return f.m.registers[pc] == kernelBoundary+end
+	})
 }
 
-// Continue through the actual scheduler MRET, not merely its entry label.
+// runToMRET executes through the actual scheduler MRET, not merely its entry
+// label (MRET-executed semantics).
 func (f *kernelFixture) runToMRET(from string, limit int) {
 	f.t.Helper()
 	start, ok := f.labels[from]
@@ -265,32 +220,23 @@ func (f *kernelFixture) runToMRET(from string, limit int) {
 	}
 	f.phase = from + "->MRET"
 	f.m.registers[pc] = kernelBoundary + start
-	for i := 0; i < limit; i++ {
-		current := f.m.registers[pc]
-		if current < kernelBoundary {
-			f.fail("escaped kernel before MRET")
-		}
-		if _, ok := f.pages[(current-kernelBoundary)/pageSize]; !ok {
-			f.fail("PC is unmapped")
-		}
-		if !f.m.fetch() {
-			f.fail("fetch fault")
-		}
-		inst, ok := f.m.decode()
-		if !ok || f.m.checkIllegalRegisterAccess(inst) || f.m.checkIllegalInstruction(inst) {
-			f.fail("decode or access fault")
-		}
-		f.m.execute(inst)
-		if inst.opcode == MRET {
-			return
-		}
-	}
-	f.fail(fmt.Sprintf("MRET step budget %d exhausted", limit))
+	s := f.runner("escaped kernel before MRET")
+	s.runBudget(f.phase, limit, "MRET step budget", func(inst Instruction, _ uint32) bool {
+		return inst.opcode == MRET
+	})
 }
 
 func (f *kernelFixture) fail(reason string) {
 	f.t.Helper()
 	f.t.Fatal(f.diagnostic(reason))
+}
+
+// diagnosticText is the in-process, return-only variant of fail for future
+// relocation tests, which need the text without ending the test. The subprocess
+// budget test above remains the proof that a real failure prints it.
+func (f *kernelFixture) diagnosticText(reason string) string {
+	f.t.Helper()
+	return f.diagnostic(reason)
 }
 
 // Diagnostics must not fault again when the CPU or page tables are corrupt.
@@ -589,9 +535,48 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	if string(otherHeader) != string(f.m.memory[f.phys(otherPCB):f.phys(otherPCB)+84]) || string(otherSnapshot) != string(f.m.memory[otherFrame:otherFrame+pageSize]) {
 		t.Fatal("fork/scheduler changed unrelated PID 2 PCB or frame")
 	}
-	// Branch probes resume the real MRET context, but do not execute the
-	// samples' wait/exit syscalls end-to-end. fork_test expects zero and falls
-	// into the parent path with the actual -2 child result.
+}
+
+// Branch probes resume the real MRET context, but do not execute the samples'
+// wait/exit syscalls end-to-end. fork_test expects zero and falls into the
+// parent path with the actual -2 child result, while fork.asm expects -2.
+func TestKernelFixtureForkSampleBranchDiscrepancy(t *testing.T) {
+	f := newKernelFixture(t)
+	f.identityPCBPages(0, 1)
+	parent := uint32(PCBVectorStart)
+	child := parent + PCBStride
+	parentPT := parent + 80
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 2)
+	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
+	f.put(parent+4, ^uint32(0))
+	f.put(parent+72, 1)
+	for off := uint32(20); off <= 68; off += 4 {
+		f.put(parent+off, 0x1000+off)
+	}
+	f.put(parent+60, 8)
+	f.put(parent+64, 0x3ff0)
+	f.put(parent+68, 32|8)
+	sample, err := assembler.RunAssembler("../asm/samples/fork_test.asm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sample) != 76 {
+		t.Fatalf("fork_test sample length %d, baseline 76", len(sample))
+	}
+	parentFrame := f.next
+	f.next += pageSize
+	copy(f.m.memory[parentFrame:parentFrame+pageSize], sample)
+	f.put(parentPT, isPteMappedMask|parentFrame/pageSize)
+	f.put(parent+76, 1)
+	f.initBitmap()
+	f.run("fork", "schedule", 20000000)
+	if f.get(parent+56) != 1 || f.get(child+56) != ^uint32(1) {
+		t.Fatalf("fork returns parent=%#x child=%#x", f.get(parent+56), f.get(child+56))
+	}
+	f.runToMRET("schedule", 500)
+	if f.m.registers[pc] != 8 {
+		t.Fatalf("child resumed at PC=%#x, want 8", f.m.registers[pc])
+	}
 	for i := 0; i < 3; i++ {
 		if !f.m.fetch() {
 			t.Fatal("sample fetch fault")
@@ -613,6 +598,11 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	if len(other) != 44 {
 		t.Fatalf("fork sample length %d, baseline 44", len(other))
 	}
+	childPTE := f.get(child + 80)
+	if childPTE&isPteMappedMask == 0 {
+		t.Fatalf("child page table entry %#x is not mapped", childPTE)
+	}
+	allocated := (childPTE & 0xfffff) * pageSize
 	copy(f.m.memory[allocated:], other)
 	f.m.registers[pc] = 0
 	for i := 0; i < 4; i++ {
