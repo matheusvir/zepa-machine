@@ -96,10 +96,35 @@ func (f *kernelFixture) initBitmap() {
 	f.bitmapReady = true
 }
 
-// Fork forms physical page-table addresses by subtracting the kernel boundary,
-// so those particular PCB pages must be identity backed, unlike other regions.
-// Only requested tables are mapped. The fixed compact layout supports PIDs
-// whose entire PCB fits below the compact KPTR; reject larger PIDs rather than alias.
+// identityPages makes each page reachable through KPTR at its own page index,
+// copying any previous backing so a remap does not hide visible bytes. Fork
+// forms physical page-table addresses by subtracting the kernel boundary, and
+// map_page/page_release reach their tables through the kernel window, so those
+// pages must be identity backed.
+func (f *kernelFixture) identityPages(pages ...uint32) {
+	f.t.Helper()
+	for _, page := range pages {
+		addr := page * pageSize
+		if int(addr)+pageSize > len(f.m.memory) {
+			f.t.Fatalf("identity page %#x beyond backing %#x", addr, len(f.m.memory))
+		}
+		if old, ok := f.pages[page]; ok && old == addr {
+			continue
+		}
+		if old, ok := f.pages[page]; ok {
+			copy(f.m.memory[addr:addr+pageSize], f.m.memory[old:old+pageSize])
+		}
+		f.pages[page] = addr
+		binary.LittleEndian.PutUint32(f.m.memory[fixtureKPTR+page*4:], isPteMappedMask|page)
+		if got, ok := f.m.lookupPhysical(kernelBoundary+addr, 4); !ok || got != addr {
+			f.t.Fatalf("identity mapping %#x got %#x mapped=%v", addr, got, ok)
+		}
+	}
+}
+
+// identityPCBPages identity maps every page of the requested PCB slots. The
+// fixed compact layout supports PIDs whose entire PCB fits below the compact
+// KPTR; reject larger PIDs rather than alias.
 func (f *kernelFixture) identityPCBPages(pids ...uint32) {
 	f.t.Helper()
 	for _, pid := range pids {
@@ -108,20 +133,11 @@ func (f *kernelFixture) identityPCBPages(pids ...uint32) {
 		if end > fixtureKPTR {
 			f.t.Fatalf("PID %d PCB end %#x overlaps compact KPTR %#x", pid, end, fixtureKPTR)
 		}
+		var pages []uint32
 		for addr := uint32(start) & ^uint32(pageSize-1); uint64(addr) < end; addr += pageSize {
-			page := addr / pageSize
-			if old, ok := f.pages[page]; ok && old == addr {
-				continue
-			}
-			if old, ok := f.pages[page]; ok {
-				copy(f.m.memory[addr:addr+pageSize], f.m.memory[old:old+pageSize])
-			}
-			f.pages[page] = addr
-			binary.LittleEndian.PutUint32(f.m.memory[fixtureKPTR+page*4:], isPteMappedMask|page)
-			if got, ok := f.m.lookupPhysical(kernelBoundary+addr, 4); !ok || got != addr {
-				f.t.Fatalf("PCB identity mapping %#x got %#x mapped=%v", addr, got, ok)
-			}
+			pages = append(pages, addr/pageSize)
 		}
+		f.identityPages(pages...)
 	}
 }
 

@@ -380,9 +380,9 @@ func TestKernelControlBitmapRelocationPatch(t *testing.T) {
 // Remaining carry-over checklist for later F2-07 stages:
 //   - Keep the full-tier 1 GiB + 4 KiB stage pending (RunnerMinimumBackingBytes,
 //     machine/kernel_layout.go:20). Stage 2 shapes only the compact bitmap.
-//   - PR body: state the relation to PR11 (fix/f2-09-kernel-transfer-buffer-test-25,
-//     merge 5c1a7b5). Both branches replace the removed LoadBuffer in
-//     kernel_asm_layout_test.go; rebase on PR11 and drop the duplicate hunk.
+//   - PR body: PR11 (fix/f2-09-kernel-transfer-buffer-test-25) is already
+//     merged at base 5c1a7b5; this branch builds on its LoadBuffer fix, so no
+//     rebase or duplicate hunk remains.
 
 // frameSelectionUPTR is a dedicated user page-table page above the fixture's
 // KPTR. The default fixtureUPTR (0x1100000) ends exactly at KPTR's end, so
@@ -457,30 +457,12 @@ func (f *kernelFixture) releaseFrames(from, count uint32) {
 	}
 }
 
-// identityFrames makes each physical frame reachable through KPTR at its own
-// page index, following the identityPCBPages pattern in kernel_fixture_test.go.
-// map_page writes its user page table and pages_used through that kernel window.
-func (f *kernelFixture) identityFrames(frames ...uint32) {
-	f.t.Helper()
-	for _, frame := range frames {
-		addr := frame * pageSize
-		if old, ok := f.pages[frame]; ok && old == addr {
-			continue
-		}
-		if old, ok := f.pages[frame]; ok {
-			copy(f.m.memory[addr:addr+pageSize], f.m.memory[old:old+pageSize])
-		}
-		f.pages[frame] = addr
-		binary.LittleEndian.PutUint32(f.m.memory[fixtureKPTR+frame*4:], isPteMappedMask|frame)
-	}
-}
-
 // prepareFrameSelection gives map_page a writable user page table and a zero
 // pages_used word. Both pages are identity mapped so the kernel-window stores
 // land in the frame the tables describe.
 func (f *kernelFixture) prepareFrameSelection() {
 	f.t.Helper()
-	f.identityFrames(frameSelectionUPTR/pageSize, frameSelectionUPTR/pageSize-1)
+	f.identityPages(frameSelectionUPTR/pageSize, frameSelectionUPTR/pageSize-1)
 	f.put(frameSelectionUPTR-4, 0)
 	f.m.registers[uptr] = frameSelectionUPTR
 }
@@ -590,7 +572,9 @@ const (
 	controlExceptionSteps = 1_000
 	controlInputSteps     = 100_000
 	controlScheduleSteps  = 500
-	controlInputBuffer    = uint32(0x3ffff000) // last 4 KiB below 1 GiB
+	// input_int computes BUFFER_START as 0 - buffer_size, so a one-page
+	// buffer wraps to virtual 0xFFFFF000: the last page below the 4 GiB limit.
+	controlInputBuffer = uint32(0x3ffff000)
 )
 
 // writeInputImage publishes image through the compact page input_int reads as
@@ -690,5 +674,263 @@ func TestKernelControlInputExceptionUserEntry(t *testing.T) {
 	}
 	if got, want := f.m.memory[physical:physical+4], sample[:4]; string(got) != string(want) {
 		t.Fatalf("first user instruction %x, want %x", got, want)
+	}
+}
+
+// F2-07 stage 4: named region/PCB snapshots and allow-list diffs.
+//
+// Issue #23 requires evidence that a handler changes only its documented
+// target: kernel code, a neighbor's bytes/PTEs/frames (including the full 3 MiB
+// page table) and the image-window source must stay byte-identical.
+// snapshotRegion reads kernel-mapped bytes; snapshotPCB captures the PCB fields
+// the fixture treats as observable. snapshotRegisters from stage 1 remains the
+// single live-register snapshot and is reused below.
+
+// regionSnapshot is a named copy of a kernel-mapped byte range.
+type regionSnapshot struct {
+	region string
+	start  uint32
+	data   []byte
+}
+
+// snapshotRegion copies size bytes starting at the kernel offset start. It
+// splits the copy at page boundaries so each page resolves through f.phys.
+func (f *kernelFixture) snapshotRegion(region string, start, size uint32) regionSnapshot {
+	f.t.Helper()
+	if size == 0 {
+		f.t.Fatalf("region %s has zero size", region)
+	}
+	data := make([]byte, size)
+	for off := uint32(0); off < size; {
+		addr := start + off
+		n := pageSize - addr%pageSize
+		if n > size-off {
+			n = size - off
+		}
+		physical := f.phys(addr)
+		copy(data[off:off+n], f.m.memory[physical:physical+n])
+		off += n
+	}
+	return regionSnapshot{region: region, start: start, data: data}
+}
+
+// diffRegion reports the first changed byte outside allowed, naming the region
+// and address. A nil allow-list requires the whole region to be unchanged.
+func (f *kernelFixture) diffRegion(before, after regionSnapshot, allowed map[uint32]bool) error {
+	f.t.Helper()
+	if before.region != after.region || before.start != after.start || len(before.data) != len(after.data) {
+		return fmt.Errorf("region %s shape changed: start %#x/%#x size %d/%d",
+			before.region, before.start, after.start, len(before.data), len(after.data))
+	}
+	for i := range before.data {
+		if before.data[i] == after.data[i] {
+			continue
+		}
+		addr := before.start + uint32(i)
+		if allowed[addr] {
+			continue
+		}
+		return fmt.Errorf("region %s changed at %#x: %#x -> %#x", before.region, addr, before.data[i], after.data[i])
+	}
+	return nil
+}
+
+// pcbSnapshot captures family links 0/4/8/12, flags, the first PTE and the saved
+// W0-W9 context. A full 3 MiB table is covered by snapshotRegion.
+type pcbSnapshot struct {
+	pid       uint32
+	parent    uint32
+	child     uint32
+	previous  uint32
+	next      uint32
+	flags     uint32
+	pte       uint32
+	registers [10]uint32
+}
+
+func (f *kernelFixture) snapshotPCB(pid uint32) pcbSnapshot {
+	f.t.Helper()
+	pcb := uint32(PCBVectorStart) + pid*PCBStride
+	s := pcbSnapshot{
+		pid:      pid,
+		parent:   f.get(pcb + PCBParentOffset),
+		child:    f.get(pcb + PCBChildOffset),
+		previous: f.get(pcb + PCBPreviousSiblingOffset),
+		next:     f.get(pcb + PCBNextSiblingOffset),
+		flags:    f.get(pcb + PCBFlagsOffset),
+		pte:      f.get(pcb + PCBPageTableOffset),
+	}
+	for i := range s.registers {
+		s.registers[i] = f.get(pcb + PCBW0Offset + uint32(i)*4)
+	}
+	return s
+}
+
+// diffPCB reports the first changed field outside allowed, named by field.
+func (f *kernelFixture) diffPCB(before, after pcbSnapshot, allowed map[string]bool) error {
+	f.t.Helper()
+	if before.pid != after.pid {
+		return fmt.Errorf("PCB pid changed: %d -> %d", before.pid, after.pid)
+	}
+	fields := []struct {
+		name   string
+		before uint32
+		after  uint32
+	}{
+		{"parent", before.parent, after.parent},
+		{"child", before.child, after.child},
+		{"previous", before.previous, after.previous},
+		{"next", before.next, after.next},
+		{"flags", before.flags, after.flags},
+		{"pte", before.pte, after.pte},
+	}
+	for _, field := range fields {
+		if field.before != field.after && !allowed[field.name] {
+			return fmt.Errorf("PCB %d %s changed: %#x -> %#x", before.pid, field.name, field.before, field.after)
+		}
+	}
+	for i := range before.registers {
+		name := fmt.Sprintf("w%d", i)
+		if before.registers[i] != after.registers[i] && !allowed[name] {
+			return fmt.Errorf("PCB %d %s changed: %#x -> %#x", before.pid, name, before.registers[i], after.registers[i])
+		}
+	}
+	return nil
+}
+
+// TestKernelControlSnapshotDiff checks that the allow-listed diff names the
+// region and address, and accepts a listed change.
+func TestKernelControlSnapshotDiff(t *testing.T) {
+	f := newKernelFixture(t)
+	start := uint32(KernelCodeStart)
+	before := f.snapshotRegion("probe.region", start, 8)
+	changed := start + 4
+	f.m.memory[f.phys(changed)] ^= 0xFF
+	after := f.snapshotRegion("probe.region", start, 8)
+	cases := []struct {
+		name    string
+		allowed map[uint32]bool
+		wantErr bool
+	}{
+		{name: "unexpected", wantErr: true},
+		{name: "allow-listed", allowed: map[uint32]bool{changed: true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := f.diffRegion(before, after, c.allowed)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("diffRegion error = %v, wantErr %v", err, c.wantErr)
+			}
+			if err != nil && (!strings.Contains(err.Error(), "probe.region") || !strings.Contains(err.Error(), fmt.Sprintf("%#x", changed))) {
+				t.Fatalf("diffRegion error %q does not name the region and address", err)
+			}
+		})
+	}
+}
+
+// TestKernelControlSnapshotStability runs the real input_int exception flow and
+// proves that kernel code, a neighbor's header/frame/bitmap and full 3 MiB page
+// table, and the image-window source stay unchanged. The live register snapshot
+// also shows that KPTR, ESA and EFA are not disturbed.
+func TestKernelControlSnapshotStability(t *testing.T) {
+	sample, err := assembler.RunAssembler("../asm/samples/infinite_loop.asm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newKernelFixtureBytes(t, controlMemoryBytes)
+	f.identityPCBPages(0, 1)
+	for off := uint32(KernelCodeStart); off < uint32(KernelCodeEnd); off += pageSize {
+		f.mapKernel(off) // cover the full code reservation, not only the image pages
+	}
+
+	neighborPCB := uint32(PCBVectorStart) + PCBStride
+	neighborTable := neighborPCB + PCBPageTableOffset
+	neighborTableBytes := uint32(PCBStride - PCBPageTableOffset)
+	if neighborTableBytes != 0x300000 {
+		t.Fatalf("neighbor page table = %#x bytes, want 3 MiB", neighborTableBytes)
+	}
+	// A reserved frame below the fixture tail: the allocator never reaches it,
+	// and its bitmap word is away from the target's first free frame.
+	neighborFrame := uint32(fixtureFrames) / pageSize / 2 * pageSize
+	f.identityPages(neighborFrame / pageSize)
+	for i := uint32(0); i < pageSize; i++ {
+		f.m.memory[neighborFrame+i] = byte(i*37 + 11)
+	}
+	f.put(neighborPCB+PCBParentOffset, 0)
+	f.put(neighborPCB+PCBChildOffset, 2)
+	f.put(neighborPCB+PCBPreviousSiblingOffset, 3)
+	f.put(neighborPCB+PCBNextSiblingOffset, 4)
+	// Mapped but not ready: the scheduler may scan this slot but must not write it.
+	f.put(neighborPCB+PCBFlagsOffset, 1)
+	f.put(neighborPCB+PCBPagesUsedOffset, 1)
+	f.put(neighborPCB+PCBPageTableOffset, isPteMappedMask|neighborFrame/pageSize)
+	for i := uint32(0); i < 10; i++ {
+		f.put(neighborPCB+PCBW0Offset+i*4, 0xA5000000+i)
+	}
+	for _, entry := range []uint32{1, 16, 0x40000, neighborTableBytes/4 - 1} {
+		f.put(neighborTable+entry*4, 0xC0DE0000|entry)
+	}
+	neighborWord := uint32(BitmapStart) + neighborFrame/pageSize/32*4
+
+	// Populate the image window so a stray exec source read or write is visible.
+	imageBytes := uint32(ImageWindowEnd - ImageWindowStart)
+	for off := uint32(0); off < imageBytes; off += pageSize {
+		f.mapKernel(uint32(ImageWindowStart) + off)
+	}
+	for off := uint32(0); off < imageBytes; off++ {
+		f.m.memory[f.phys(uint32(ImageWindowStart)+off)] = byte(off*13 + 7)
+	}
+
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 2)
+	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), ^uint32(0))
+	writeInputImage(f, sample)
+	f.enterException(inputInt, "input_int", controlExceptionSteps)
+
+	probes := []struct {
+		name string
+		grab func(*kernelFixture) regionSnapshot
+	}{
+		{"kernel.code", func(f *kernelFixture) regionSnapshot {
+			return f.snapshotRegion("kernel.code", uint32(KernelCodeStart), uint32(KernelCodeEnd-KernelCodeStart))
+		}},
+		{"image.window", func(f *kernelFixture) regionSnapshot {
+			return f.snapshotRegion("image.window", uint32(ImageWindowStart), imageBytes)
+		}},
+		{"neighbor.header", func(f *kernelFixture) regionSnapshot {
+			return f.snapshotRegion("neighbor.header", neighborPCB, PCBPageTableOffset)
+		}},
+		{"neighbor.frame", func(f *kernelFixture) regionSnapshot {
+			return f.snapshotRegion("neighbor.frame", neighborFrame, pageSize)
+		}},
+		{"neighbor.ptes", func(f *kernelFixture) regionSnapshot {
+			return f.snapshotRegion("neighbor.ptes", neighborTable, neighborTableBytes)
+		}},
+		{"neighbor.bitmap", func(f *kernelFixture) regionSnapshot {
+			return f.snapshotRegion("neighbor.bitmap", neighborWord, 4)
+		}},
+	}
+	before := make([]regionSnapshot, len(probes))
+	for i, probe := range probes {
+		before[i] = probe.grab(f)
+	}
+	beforePCB := f.snapshotPCB(1)
+	beforeRegs := f.snapshotRegisters()
+
+	f.run("input_int", "schedule", controlInputSteps)
+	f.runToMRET("schedule", controlScheduleSteps)
+
+	for i, probe := range probes {
+		if err := f.diffRegion(before[i], probe.grab(f), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.diffPCB(beforePCB, f.snapshotPCB(1), nil); err != nil {
+		t.Fatal(err)
+	}
+	afterRegs := f.snapshotRegisters()
+	for _, reg := range []Register{kptr, esa, efa} {
+		if afterRegs[reg] != beforeRegs[reg] {
+			t.Fatalf("register %d changed: %#x -> %#x", reg, beforeRegs[reg], afterRegs[reg])
+		}
 	}
 }
