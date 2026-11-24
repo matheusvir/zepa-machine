@@ -26,6 +26,7 @@ package machine
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -120,6 +121,11 @@ var kernelRelocations = []layoutProbe{
 	{name: "bitmap.low", anchor: relocationAnchor{"setup", 44}, want: 0x9024, kind: probeImmediate},
 	{name: "bitmap.base", anchor: relocationAnchor{"setup", 45}, start: 41, want: 0x30109024, kind: probeRegister, register: w0},
 
+	// Bitmap extension span: #15 shifts the one-byte step into 2^15 bytes,
+	// the full 1 GiB bitmap (sackOS/kernel.asm:77-79). Verify-only; the compact
+	// fixture cannot populate that span.
+	{name: "bitmap.extension", anchor: relocationAnchor{"setup", 48}, want: 15, kind: probeImmediate},
+
 	// Kernel stack top and control status record.
 	{name: "stack.top", anchor: relocationAnchor{"setup", 64}, start: 62, want: 0xFFFD0000, kind: probeRegister, register: sp},
 	{name: "status.physical", anchor: relocationAnchor{"setup", 72}, start: 68, want: 0x3FFD0100, kind: probeRegister, register: w0},
@@ -191,13 +197,47 @@ func (f *kernelFixture) runLayoutProbe(snapshot map[Register]uint32, p layoutPro
 	return p.observe(f.m, last)
 }
 
+// layoutMismatch returns the same text verifyLayoutProbe reports for got, so
+// the in-process self-test can assert the diagnostic path without failing.
+func (f *kernelFixture) layoutMismatch(p layoutProbe, got uint32) string {
+	return fmt.Sprintf("relocation %s anchor=%s: expected %#x got %#x: %s",
+		p.name, p.anchor, p.want, got, f.diagnosticText("relocation literal mismatch"))
+}
+
 func (f *kernelFixture) verifyLayoutProbe(snapshot map[Register]uint32, p layoutProbe) {
 	f.t.Helper()
 	got := f.runLayoutProbe(snapshot, p)
 	if got != p.want {
-		f.t.Fatalf("relocation %s anchor=%s: expected %#x got %#x: %s",
-			p.name, p.anchor, p.want, got, f.diagnosticText("relocation literal mismatch"))
+		f.t.Fatal(f.layoutMismatch(p, got))
 	}
+}
+
+// relocationProbe finds a table entry by name, so the self-test cannot drift
+// from the relocation table it exercises.
+func relocationProbe(t *testing.T, name string) layoutProbe {
+	t.Helper()
+	for _, p := range kernelRelocations {
+		if p.name == name {
+			return p
+		}
+	}
+	t.Fatalf("missing relocation %s", name)
+	return layoutProbe{}
+}
+
+// adulterateImmediate rewrites one instruction's immediate field, leaving its
+// opcode and register fields intact, so a probe observes a different literal.
+func (f *kernelFixture) adulterateImmediate(p layoutProbe, value uint16) {
+	f.t.Helper()
+	base, ok := f.labels[p.anchor.label]
+	if !ok {
+		f.t.Fatalf("relocation %s: missing label %s", p.name, p.anchor.label)
+	}
+	offset := base + uint32(p.anchor.ordinal)*4
+	physical := f.phys(offset)
+	word := binary.BigEndian.Uint32(f.m.memory[physical:])
+	word = word&^(uint32(immediateBitMask)<<5) | uint32(value)<<5
+	binary.BigEndian.PutUint32(f.m.memory[physical:], word)
 }
 
 // applyBitmapPatch rewrites the high and low immediates of a bitmap-base
@@ -233,6 +273,50 @@ func TestKernelControlRelocationTable(t *testing.T) {
 	for _, p := range kernelRelocations {
 		f := newKernelFixture(t)
 		f.verifyLayoutProbe(f.snapshotRegisters(), p)
+	}
+}
+
+// TestKernelControlRelocationMismatchDiagnostic adulterates one table literal
+// and asserts the same diagnostic verifyLayoutProbe would emit, without
+// replacing the real instruction execution.
+func TestKernelControlRelocationMismatchDiagnostic(t *testing.T) {
+	cases := []struct {
+		name  string
+		probe string
+		value uint16
+	}{
+		{name: "global literal", probe: "global.max_processes", value: 0x4001},
+		{name: "bitmap extension literal", probe: "bitmap.extension", value: 14},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := relocationProbe(t, c.probe)
+			if p.kind != probeImmediate {
+				t.Fatalf("mismatch self-test %s needs an immediate probe", p.name)
+			}
+			f := newKernelFixture(t)
+			f.adulterateImmediate(p, c.value)
+			got := f.runLayoutProbe(f.snapshotRegisters(), p)
+			if got != uint32(c.value) {
+				t.Fatalf("%s: observed %#x, want adulterated %#x", p.name, got, c.value)
+			}
+			if got == p.want {
+				t.Fatalf("%s: adulterated literal still matched %#x", p.name, p.want)
+			}
+			text := f.layoutMismatch(p, got)
+			for _, want := range []string{
+				"relocation " + p.name,
+				"anchor=" + p.anchor.String(),
+				fmt.Sprintf("expected %#x", p.want),
+				fmt.Sprintf("got %#x", got),
+				"relocation literal mismatch",
+				"phase=" + p.name,
+			} {
+				if !strings.Contains(text, want) {
+					t.Errorf("%s diagnostic missing %q: %s", p.name, want, text)
+				}
+			}
+		})
 	}
 }
 
@@ -291,14 +375,7 @@ func TestKernelControlBitmapRelocationPatch(t *testing.T) {
 // helpers shape the bitmap and then run the real map_page; they do not replace
 // it with a Go allocator.
 //
-// Carry-over checklist for later F2-07 stages:
-//   - Add a stage-1 self-test that feeds verifyLayoutProbe a wrong literal and
-//     asserts the in-process diagnostic text (diagnosticText,
-//     machine/kernel_fixture_test.go:237). Stage 1 only exercises passing
-//     entries today.
-//   - Add a verify-only entry for setup's bitmap-extension literal
-//     `MV W2, #15` (sackOS/kernel.asm:77-79). Its 2^15-byte span describes the
-//     full 1 GiB bitmap, which the compact 32 MiB fixture cannot observe.
+// Remaining carry-over checklist for later F2-07 stages:
 //   - Keep the full-tier 1 GiB + 4 KiB stage pending (RunnerMinimumBackingBytes,
 //     machine/kernel_layout.go:20). Stage 2 shapes only the compact bitmap.
 //   - PR body: state the relation to PR11 (fix/f2-09-kernel-transfer-buffer-test-25,
