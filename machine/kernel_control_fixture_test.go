@@ -15,11 +15,14 @@ package machine
 // shared scanASMKernel path used by the compact fixture, so this file neither
 // reimplements a handler nor reads a literal out of the source text.
 //
-// Only the bitmap base built after setup (orphanize_end and map_page) is an
-// executable patch. The patch supplies the relocated high half and a zero low
-// half: a zero low half cannot be sign-extended by MV, so the patched address is
-// independent of the #0x9024 sign extension. KPTR, the stack top and the status
-// record are verify-only.
+// Only the bitmap bases built after setup are executable patches: map_page
+// (sackOS/kernel.asm:2297-2306) and page_release (sackOS/kernel.asm:2535-2540).
+// The F2-02 page_release helper replaced kill's inline release loop, so the
+// construction formerly at orphanize_end now lives in page_release; orphanize_end
+// only jumps to schedule (sackOS/kernel.asm:1901). Each patch supplies the
+// relocated high half and a zero low half: a zero low half cannot be
+// sign-extended by MV, so the patched address is independent of the #0x9024
+// sign extension. KPTR, the stack top and the status record are verify-only.
 import (
 	"encoding/binary"
 	"fmt"
@@ -51,11 +54,15 @@ const (
 
 // bitmapPatch marks the two bitmap-base instructions that may be rewritten for
 // compact RAM: the high-half MV and the low-half MV, as ordinals from the
-// anchor's label, plus the ordinal of the ADD that combines the halves.
+// anchor's label, plus the ordinal of the ADD that combines the halves. result
+// and boundary name the registers the patched site uses for the assembled base
+// and the kernel boundary: map_page uses W0/K0, page_release uses W4/W5.
 type bitmapPatch struct {
-	high    int
-	low     int
-	virtual int
+	high     int
+	low      int
+	virtual  int
+	result   Register
+	boundary Register
 }
 
 // layoutProbe is one table entry. kind selects whether the expected literal is
@@ -117,11 +124,13 @@ var kernelRelocations = []layoutProbe{
 	{name: "stack.top", anchor: relocationAnchor{"setup", 64}, start: 62, want: 0xFFFD0000, kind: probeRegister, register: sp},
 	{name: "status.physical", anchor: relocationAnchor{"setup", 72}, start: 68, want: 0x3FFD0100, kind: probeRegister, register: w0},
 
-	// Executable patches: the bitmap base after setup. These are the only
-	// entries with a patch; the bitmap construction in setup is verified above
-	// and the KPTR, stack and status constructions never change.
-	{name: "bitmap.base.orphanize_end", anchor: relocationAnchor{"orphanize_end", 4}, want: 0x30109024, kind: probeRegister, register: w0, patch: &bitmapPatch{high: 0, low: 3, virtual: 5}},
-	{name: "bitmap.base.map_page", anchor: relocationAnchor{"map_page", 4}, want: 0x30109024, kind: probeRegister, register: w0, patch: &bitmapPatch{high: 0, low: 3, virtual: 8}},
+	// Executable patches: the bitmap bases after setup. kill no longer builds
+	// one: it passes the target PCB to page_release, which repeats the
+	// construction before storing the address on its stack (sackOS/kernel.asm:2535).
+	// The setup construction is verified above, and the KPTR, stack and status
+	// constructions never change.
+	{name: "bitmap.base.map_page", anchor: relocationAnchor{"map_page", 4}, start: 0, want: 0x30109024, kind: probeRegister, register: w0, patch: &bitmapPatch{high: 0, low: 3, virtual: 8, result: w0, boundary: k0}},
+	{name: "bitmap.base.page_release", anchor: relocationAnchor{"page_release", 59}, start: 55, want: 0x30109024, kind: probeRegister, register: w4, patch: &bitmapPatch{high: 55, low: 58, virtual: 60, result: w4, boundary: w5}},
 }
 
 // kernelNonRelocations are values that must survive a layout move unchanged.
@@ -243,7 +252,7 @@ func TestKernelControlBitmapRelocationPatch(t *testing.T) {
 		if p.patch == nil {
 			continue
 		}
-		if p.name != "bitmap.base.orphanize_end" && p.name != "bitmap.base.map_page" {
+		if p.name != "bitmap.base.map_page" && p.name != "bitmap.base.page_release" {
 			t.Fatalf("relocation %s must be verify-only", p.name)
 		}
 		patched++
@@ -257,10 +266,11 @@ func TestKernelControlBitmapRelocationPatch(t *testing.T) {
 		virtual := layoutProbe{
 			name:     p.name + ".virtual",
 			anchor:   relocationAnchor{p.anchor.label, p.patch.virtual},
+			start:    p.start,
 			want:     kernelBoundary + fixtureRelocatedBitmap,
 			kind:     probeRegister,
-			register: w0,
-			prepare:  registerProbe(k0, kernelBoundary),
+			register: p.patch.result,
+			prepare:  registerProbe(p.patch.boundary, kernelBoundary),
 		}
 		if got := f.runLayoutProbe(snapshot, virtual); got != virtual.want {
 			f.t.Fatalf("patched bitmap %s anchor=%s: expected %#x got %#x: %s",
@@ -268,7 +278,7 @@ func TestKernelControlBitmapRelocationPatch(t *testing.T) {
 		}
 	}
 	if patched != 2 {
-		t.Fatalf("executable bitmap patches = %d, want orphanize_end and map_page", patched)
+		t.Fatalf("executable bitmap patches = %d, want map_page and page_release", patched)
 	}
 }
 
