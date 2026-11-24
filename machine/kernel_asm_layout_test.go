@@ -502,8 +502,10 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 
 	// Input interrupt from the idle loop, raised as Boot raises it.
 	if len(sample) > bufferSize-4 {
-		t.Fatal("transfer buffer rejected the sample")
+		t.Fatal("sample does not fit the transfer buffer")
 	}
+	// The test raises the interrupt itself, so it writes the buffer directly
+	// instead of going through the safe-point request path.
 	m.writeTransferBufferLocked(sample)
 	m.exception(inputInt)
 	stack.begin()
@@ -560,9 +562,6 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 
 	// Kill interrupt for PID 0 while it is running.
 	pid := make([]byte, 4)
-	if len(pid) > bufferSize-4 {
-		t.Fatal("transfer buffer rejected the PID")
-	}
 	m.writeTransferBufferLocked(pid)
 	m.exception(killInt)
 	loop := kernelBoundary + r.k.label(t, "loop")
