@@ -32,7 +32,8 @@ func putFullControl(m *Machine, offset, value uint32) {
 	binary.LittleEndian.PutUint32(m.memory[uint32(ControlRegionStart)+offset:], value)
 }
 
-// putFullBootstrap writes the host bootstrap fields and publishes Ready last.
+// putFullBootstrap writes magic, version, capabilities, bases and executable
+// length first, then publishes Ready last so it trails every payload word.
 func putFullBootstrap(m *Machine, version, controlBase, imageBase, bufferBase uint32) {
 	off := ControlBootstrapOffset
 	putFullControl(m, off+BootstrapMagicOffset, ControlMagic)
@@ -45,7 +46,8 @@ func putFullBootstrap(m *Machine, version, controlBase, imageBase, bufferBase ui
 	putFullControl(m, off+BootstrapReadyOffset, 1)
 }
 
-// putFullDescriptor writes descriptor metadata and publishes Valid last.
+// putFullDescriptor writes descriptor metadata and publishes Valid last, after
+// the caller has placed the image payload in the window.
 func putFullDescriptor(m *Machine, imageID, length, base, generation, validToken, ackToken uint32) {
 	off := ControlImageDescriptorOffset
 	putFullControl(m, off+DescriptorImageIDOffset, imageID)
@@ -79,11 +81,12 @@ func putFullImage(t *testing.T, m *Machine, image []byte) {
 func TestKernelControlFullTierRecords(t *testing.T) {
 	m := newFullTier(t)
 	putFullBootstrap(m, ControlProtocolVersion, uint32(ControlRegionStart), uint32(ImageWindowStart), uint32(TransferBufferStart))
+	// Payload before descriptor validity: Valid is the final descriptor word.
+	putFullImage(t, m, []byte{0x11, 0x22, 0x33, 0x44})
 	putFullDescriptor(m, 0x1234, 8, uint32(ImageWindowStart)+ImageLengthPrefixBytes, 0x5678, 3, 2)
 	putFullRecord(m, ControlRequestOffset, uint32(RequestExec), 0x1234, 7, 0, 5, 4, 0x99, 0)
 	putFullRecord(m, ControlResultOffset, uint32(ResultExecSucceeded), 0, 7, 0x1234, 0x99, 6, 5, 0)
 	putFullRecord(m, ControlEventOffset, uint32(EventExecSucceeded), 0, 7, 0x1234, 0x99, 8, 7, 0)
-	putFullImage(t, m, []byte{0x11, 0x22, 0x33, 0x44})
 	payload := []byte{0xAA, 0xBB, 0xCC, 0xDD}
 	m.writeTransferBufferLocked(payload)
 

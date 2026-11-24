@@ -371,15 +371,15 @@ func TestKernelControlBitmapRelocationPatch(t *testing.T) {
 // F2-07 stage 2: deterministic frame selection for the compact fixture.
 //
 // map_page scans the bitmap from word 0, least significant bit first, and stops
-// at memory_size/4096 frames (sackOS/kernel.asm:2398-2433). A fixture can only
+// at memory_size/4096 frames (sackOS/kernel.asm:2330-2365). A fixture can only
 // force a non-contiguous allocation or an exact partial exhaustion if tests can
 // edit the bitmap after initBitmap has reserved the compact prefix. These
 // helpers shape the bitmap and then run the real map_page; they do not replace
 // it with a Go allocator.
 //
-// Remaining carry-over checklist for later F2-07 stages:
-//   - Keep the full-tier 1 GiB + 4 KiB stage pending (RunnerMinimumBackingBytes,
-//     machine/kernel_layout.go:20). Stage 2 shapes only the compact bitmap.
+// Carry-over checklist for later F2-07 stages:
+//   - Full-tier 1 GiB + 4 KiB is delivered by stage 5 in
+//     machine/kernel_full_tier_test.go (newFullTier, real KPTR/bitmap).
 //   - PR body: PR11 (fix/f2-09-kernel-transfer-buffer-test-25) is already
 //     merged at base 5c1a7b5; this branch builds on its LoadBuffer fix, so no
 //     rebase or duplicate hunk remains.
@@ -985,6 +985,17 @@ func TestKernelControlSnapshotStability(t *testing.T) {
 
 	f.run("input_int", "schedule", controlInputSteps)
 	f.runToMRET("schedule", controlScheduleSteps)
+
+	// Positive control: the flow really selected PID 0 and installed its PTE.
+	if got := f.get(uint32(GlobalAddress(GlobalRunningPIDOffset))); got != 0 {
+		t.Fatalf("running_pid = %d after MRET, want 0", got)
+	}
+	if got := f.get(uint32(PCBVectorStart) + PCBFlagsOffset); got&1 == 0 {
+		t.Fatalf("PCB 0 flags = %#x after MRET, want mapped", got)
+	}
+	if got := f.get(uint32(PCBVectorStart) + PCBPageTableOffset); got&isPteMappedMask == 0 {
+		t.Fatalf("PCB 0 PTE = %#x after MRET, want valid", got)
+	}
 
 	for i, probe := range probes {
 		if err := f.diffRegion(before[i], probe.grab(f), nil); err != nil {
