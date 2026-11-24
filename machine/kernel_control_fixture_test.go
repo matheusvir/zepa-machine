@@ -735,30 +735,41 @@ func (f *kernelFixture) diffRegion(before, after regionSnapshot, allowed map[uin
 	return nil
 }
 
-// pcbSnapshot captures family links 0/4/8/12, flags, the first PTE and the saved
-// W0-W9 context. A full 3 MiB table is covered by snapshotRegion.
+// pcbSnapshot captures family links 0/4/8/12, status address 16, saved W0-W9
+// 20-56, PC/SP/SR 60/64/68, flags 72, pages_used 76 and the first PTE 80. A
+// full 3 MiB table is covered by snapshotRegion.
 type pcbSnapshot struct {
-	pid       uint32
-	parent    uint32
-	child     uint32
-	previous  uint32
-	next      uint32
-	flags     uint32
-	pte       uint32
-	registers [10]uint32
+	pid        uint32
+	parent     uint32
+	child      uint32
+	previous   uint32
+	next       uint32
+	statusAddr uint32
+	flags      uint32
+	pc         uint32
+	sp         uint32
+	sr         uint32
+	pagesUsed  uint32
+	pte        uint32
+	registers  [10]uint32
 }
 
 func (f *kernelFixture) snapshotPCB(pid uint32) pcbSnapshot {
 	f.t.Helper()
 	pcb := uint32(PCBVectorStart) + pid*PCBStride
 	s := pcbSnapshot{
-		pid:      pid,
-		parent:   f.get(pcb + PCBParentOffset),
-		child:    f.get(pcb + PCBChildOffset),
-		previous: f.get(pcb + PCBPreviousSiblingOffset),
-		next:     f.get(pcb + PCBNextSiblingOffset),
-		flags:    f.get(pcb + PCBFlagsOffset),
-		pte:      f.get(pcb + PCBPageTableOffset),
+		pid:        pid,
+		parent:     f.get(pcb + PCBParentOffset),
+		child:      f.get(pcb + PCBChildOffset),
+		previous:   f.get(pcb + PCBPreviousSiblingOffset),
+		next:       f.get(pcb + PCBNextSiblingOffset),
+		statusAddr: f.get(pcb + PCBStatusAddressOffset),
+		flags:      f.get(pcb + PCBFlagsOffset),
+		pc:         f.get(pcb + PCBProgramCounterOffset),
+		sp:         f.get(pcb + PCBStackPointerOffset),
+		sr:         f.get(pcb + PCBStatusRegisterOffset),
+		pagesUsed:  f.get(pcb + PCBPagesUsedOffset),
+		pte:        f.get(pcb + PCBPageTableOffset),
 	}
 	for i := range s.registers {
 		s.registers[i] = f.get(pcb + PCBW0Offset + uint32(i)*4)
@@ -781,7 +792,12 @@ func (f *kernelFixture) diffPCB(before, after pcbSnapshot, allowed map[string]bo
 		{"child", before.child, after.child},
 		{"previous", before.previous, after.previous},
 		{"next", before.next, after.next},
+		{"status_addr", before.statusAddr, after.statusAddr},
 		{"flags", before.flags, after.flags},
+		{"pc", before.pc, after.pc},
+		{"sp", before.sp, after.sp},
+		{"sr", before.sr, after.sr},
+		{"pages_used", before.pagesUsed, after.pagesUsed},
 		{"pte", before.pte, after.pte},
 	}
 	for _, field := range fields {
@@ -823,6 +839,57 @@ func TestKernelControlSnapshotDiff(t *testing.T) {
 			}
 			if err != nil && (!strings.Contains(err.Error(), "probe.region") || !strings.Contains(err.Error(), fmt.Sprintf("%#x", changed))) {
 				t.Fatalf("diffRegion error %q does not name the region and address", err)
+			}
+		})
+	}
+}
+
+// TestKernelControlSnapshotPCBDiff names every captured PCB field in the diff.
+// Each case changes one word, requires the field name in the error, then
+// allow-lists it and expects a clean diff.
+func TestKernelControlSnapshotPCBDiff(t *testing.T) {
+	cases := []struct {
+		name   string
+		offset uint32
+	}{
+		{"parent", PCBParentOffset},
+		{"child", PCBChildOffset},
+		{"previous", PCBPreviousSiblingOffset},
+		{"next", PCBNextSiblingOffset},
+		{"status_addr", PCBStatusAddressOffset},
+		{"flags", PCBFlagsOffset},
+		{"pc", PCBProgramCounterOffset},
+		{"sp", PCBStackPointerOffset},
+		{"sr", PCBStatusRegisterOffset},
+		{"pages_used", PCBPagesUsedOffset},
+		{"pte", PCBPageTableOffset},
+		{"w0", PCBW0Offset},
+		{"w1", PCBW0Offset + 1*4},
+		{"w2", PCBW0Offset + 2*4},
+		{"w3", PCBW0Offset + 3*4},
+		{"w4", PCBW0Offset + 4*4},
+		{"w5", PCBW0Offset + 5*4},
+		{"w6", PCBW0Offset + 6*4},
+		{"w7", PCBW0Offset + 7*4},
+		{"w8", PCBW0Offset + 8*4},
+		{"w9", PCBW0Offset + 9*4},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newKernelFixture(t)
+			pcb := uint32(PCBVectorStart) + PCBStride
+			before := f.snapshotPCB(1)
+			f.put(pcb+c.offset, ^f.get(pcb+c.offset))
+			after := f.snapshotPCB(1)
+			err := f.diffPCB(before, after, nil)
+			if err == nil {
+				t.Fatalf("diffPCB missed %s", c.name)
+			}
+			if !strings.Contains(err.Error(), c.name) {
+				t.Fatalf("diffPCB error %q does not name %s", err, c.name)
+			}
+			if err := f.diffPCB(before, after, map[string]bool{c.name: true}); err != nil {
+				t.Fatalf("allow-listed %s: %v", c.name, err)
 			}
 		})
 	}
