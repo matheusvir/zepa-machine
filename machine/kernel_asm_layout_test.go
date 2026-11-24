@@ -307,6 +307,10 @@ const (
 	asmKernelStackBottom = uint32(KernelStackStart) + KernelVirtualOffset
 	asmStatusAddr        = uint32(ControlRegionStart) + ControlStatusOffset // physical 0x3FFD0100
 	asmHandlerBudget     = 500_000
+	// kill runs page_release before any lifecycle change: one read-only pass
+	// over the whole 0xC0000-entry user table (about 3.1 million instructions)
+	// and a release pass that stops after PID 0's single page.
+	asmKillBudget = 5_000_000
 )
 
 // asmSetupRun is a machine with the runner's minimum backing on which the real
@@ -497,9 +501,10 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 	stack := trackKernelStack(s, kernelBoundary+r.k.label(t, "schedule"))
 
 	// Input interrupt from the idle loop, raised as Boot raises it.
-	if !m.LoadBuffer(sample) {
-		t.Fatal("LoadBuffer rejected the sample")
+	if len(sample) > bufferSize-4 {
+		t.Fatal("transfer buffer rejected the sample")
 	}
+	m.writeTransferBufferLocked(sample)
 	m.exception(inputInt)
 	stack.begin()
 	s.run("input_int", asmHandlerBudget, func(Instruction, uint32) bool { return !m.isKernelMode() })
@@ -555,13 +560,14 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 
 	// Kill interrupt for PID 0 while it is running.
 	pid := make([]byte, 4)
-	if !m.LoadBuffer(pid) {
-		t.Fatal("LoadBuffer rejected the PID")
+	if len(pid) > bufferSize-4 {
+		t.Fatal("transfer buffer rejected the PID")
 	}
+	m.writeTransferBufferLocked(pid)
 	m.exception(killInt)
 	loop := kernelBoundary + r.k.label(t, "loop")
 	stack.begin()
-	s.run("kill_int", asmHandlerBudget, func(Instruction, uint32) bool { return m.registers[pc] == loop })
+	s.run("kill_int", asmKillBudget, func(Instruction, uint32) bool { return m.registers[pc] == loop })
 	stack.check(t, "kill_int")
 	if got := physWord(m, bitWord); got&1 != 0 {
 		t.Fatalf("bitmap word %#x = %#x after kill, want bit 0 clear", bitWord, got)
