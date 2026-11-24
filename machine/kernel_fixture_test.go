@@ -38,10 +38,18 @@ type kernelFixture struct {
 
 func newKernelFixture(t *testing.T) *kernelFixture {
 	t.Helper()
+	return newKernelFixtureBytes(t, 32<<20)
+}
+
+// newKernelFixtureBytes is the size-parameterised compact fixture. Stages 0-2
+// keep their 32 MiB backing; F2-07 stage 3 uses a larger compact backing while
+// still sharing scanASMKernel, the KPTR register relocation and the runner.
+func newKernelFixtureBytes(t *testing.T, memoryBytes int) *kernelFixture {
+	t.Helper()
 	// The shared scanner also verifies the instruction count and every label
 	// displacement against the assembler output.
 	k := loadASMKernel(t)
-	f := &kernelFixture{t: t, m: NewMachine(32<<20, false), labels: k.labels, pages: map[uint32]uint32{}, next: fixtureFrames}
+	f := &kernelFixture{t: t, m: NewMachine(memoryBytes, false), labels: k.labels, pages: map[uint32]uint32{}, next: fixtureFrames}
 	for off := uint32(0); off < uint32(len(k.image)); off += pageSize {
 		f.mapKernel(off)
 	}

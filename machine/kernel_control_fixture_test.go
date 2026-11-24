@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	assembler "zepa-machine/cross-assembler"
 )
 
 // fixtureRelocatedBitmap is the compact, 64 KiB-aligned bitmap base used by the
@@ -571,5 +573,122 @@ func TestKernelControlFrameSelection(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// F2-07 stage 3: exception entry and the first user instruction checkpoint.
+//
+// enterException raises a cause through the real m.exception path and uses the
+// shared runner to reach the handler, so handler entry is never faked by
+// writing PC. input_int then initializes the new PCB with PC=0, SP=0xC0000000
+// and SR=56 (sackOS/kernel.asm:514-533); schedule restores those fields and
+// MRET publishes them to the CPU. F2-18 (zesh#34) expects the same post-exec
+// context. The compact fixture keeps KPTR in fixtureKPTR and maps BitmapStart
+// through it, so map_page's bitmap literal resolves without a literal patch.
+const (
+	controlMemoryBytes    = 48 << 20
+	controlExceptionSteps = 1_000
+	controlInputSteps     = 100_000
+	controlScheduleSteps  = 500
+	controlInputBuffer    = uint32(0x3ffff000) // last 4 KiB below 1 GiB
+)
+
+// writeInputImage publishes image through the compact page input_int reads as
+// BUFFER_START for a one-page buffer. The size word is at offset 0 and the
+// payload at +4, matching input_int's copy loop.
+func writeInputImage(f *kernelFixture, image []byte) {
+	f.t.Helper()
+	if len(image) == 0 || len(image) > pageSize-4 {
+		f.t.Fatalf("input image is %d bytes, want 1..%d", len(image), pageSize-4)
+	}
+	f.mapKernel(controlInputBuffer)
+	f.put(uint32(GlobalAddress(GlobalBufferSizeOffset)), pageSize)
+	f.put(controlInputBuffer, uint32(len(image)))
+	copy(f.m.memory[f.phys(controlInputBuffer+4):], image)
+}
+
+// enterException raises cause through m.exception and runs the shared runner to
+// handler entry. ESA is set to exception_supervisor as kernel setup leaves it;
+// KPTR must already hold the fixture's compact register value.
+func (f *kernelFixture) enterException(cause uint32, handler string, limit int) {
+	f.t.Helper()
+	handlerPC, ok := f.labels[handler]
+	if !ok {
+		f.t.Fatalf("missing label %s", handler)
+	}
+	supervisor, ok := f.labels["exception_supervisor"]
+	if !ok {
+		f.t.Fatal("missing label exception_supervisor")
+	}
+	if got := f.m.registers[kptr]; got != fixtureKPTR {
+		f.t.Fatalf("enterException KPTR=%#x, want fixture register %#x", got, fixtureKPTR)
+	}
+	f.m.registers[esa] = kernelBoundary + supervisor
+	f.phase = "exception_supervisor"
+	f.m.exception(cause)
+	s := f.runner("exception dispatch escaped kernel")
+	want := kernelBoundary + handlerPC
+	s.runBudget("exception_supervisor", limit, "exception dispatch step budget", func(_ Instruction, _ uint32) bool {
+		return f.m.registers[pc] == want
+	})
+}
+
+// assertUserEntry checks the CPU and PCB context at the first user instruction
+// before it executes. input_int writes the PCB fields at
+// sackOS/kernel.asm:514-533 and schedule's MRET copies them to the CPU; F2-18
+// (zesh#34) reuses the same PC/SP/SR contract.
+func (f *kernelFixture) assertUserEntry(pid uint32) {
+	f.t.Helper()
+	pcb := uint32(PCBVectorStart) + pid*PCBStride
+	for _, check := range []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"PCB.PC", f.get(pcb + PCBProgramCounterOffset), 0},
+		{"PCB.SP", f.get(pcb + PCBStackPointerOffset), 0xC0000000},
+		{"PCB.SR", f.get(pcb + PCBStatusRegisterOffset), 56},
+		{"PC", f.m.registers[pc], 0},
+		{"SP", f.m.registers[sp], 0xC0000000},
+		{"SR", f.m.registers[sr], 56},
+	} {
+		if check.got != check.want {
+			f.t.Fatalf("%s = %#x, want %#x: %s", check.name, check.got, check.want,
+				f.diagnosticText("user entry context mismatch"))
+		}
+	}
+	if f.m.isKernelMode() {
+		f.t.Fatalf("user entry still in kernel mode: %s", f.diagnosticText("user entry mode mismatch"))
+	}
+}
+
+// TestKernelControlInputExceptionUserEntry enters input_int through the real
+// exception path, runs to schedule, reuses runToMRET, and checks the first user
+// instruction context before that instruction executes.
+func TestKernelControlInputExceptionUserEntry(t *testing.T) {
+	sample, err := assembler.RunAssembler("../asm/samples/infinite_loop.asm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newKernelFixtureBytes(t, controlMemoryBytes)
+	f.identityPCBPages(0) // map_page and the user PTE share PCB 0's table page
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 1)
+	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), ^uint32(0))
+	writeInputImage(f, sample)
+	if got := f.m.registers[kptr]; got != fixtureKPTR {
+		t.Fatalf("KPTR=%#x, want fixture register %#x", got, fixtureKPTR)
+	}
+	f.enterException(inputInt, "input_int", controlExceptionSteps)
+	f.run("input_int", "schedule", controlInputSteps)
+	f.runToMRET("schedule", controlScheduleSteps)
+	f.assertUserEntry(0)
+
+	// The first user instruction is mapped but has not executed yet.
+	physical, ok := f.m.lookupPhysical(0, 4)
+	if !ok {
+		t.Fatal("first user instruction is unmapped")
+	}
+	if got, want := f.m.memory[physical:physical+4], sample[:4]; string(got) != string(want) {
+		t.Fatalf("first user instruction %x, want %x", got, want)
 	}
 }
