@@ -570,10 +570,10 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 		t.Fatalf("running_pid %d after input, want 0", got)
 	}
 	pte := physWord(m, pcb0+PCBPageTableOffset)
-	if pte&isPteMappedMask == 0 || pte&0xFFFFF < asmKernelFrames {
+	if pte&isPteMappedMask == 0 || pte&pteFrameMask < asmKernelFrames {
 		t.Fatalf("process PTE 0 = %#x, want a valid frame >= %#x", pte, asmKernelFrames)
 	}
-	frame := pte & 0xFFFFF
+	frame := pte & pteFrameMask
 	if frame != firstFrame || physWord(m, bitWord)&1 == 0 {
 		t.Fatalf("frame %#x, bitmap word %#x = %#x; want frame %#x with bit 0 set", frame, bitWord, physWord(m, bitWord), firstFrame)
 	}

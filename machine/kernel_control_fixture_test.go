@@ -37,6 +37,12 @@ import (
 // pair immune to MV sign extension.
 const fixtureRelocatedBitmap = 0x1800000
 
+// Anchors are label-relative ordinals, so inserting or deleting an instruction
+// before an anchor silently drifts it to a neighbouring instruction. To repair
+// drift, recount from the label, run the focused control test, and use the
+// guardian's mnemonic to confirm the anchor still names the intended
+// instruction. Never adjust the expected literal to make a drifted anchor pass.
+//
 // relocationAnchor names one instruction: a label plus the number of
 // instructions between that label and the anchored instruction.
 type relocationAnchor struct {
@@ -46,6 +52,29 @@ type relocationAnchor struct {
 
 func (a relocationAnchor) String() string {
 	return fmt.Sprintf("%s+%d", a.label, a.ordinal)
+}
+
+var opcodeMnemonics = map[Opcode]string{
+	MV: "MV", AND: "AND", OR: "OR", XOR: "XOR", SHL: "SHL", SHA: "SHA",
+	ADD: "ADD", SUB: "SUB", MUL: "MUL", UDIV: "UDIV", SDIV: "SDIV",
+	CMP: "CMP", JUMP: "JUMP", JMPR: "JMPR", BEQ: "BEQ", BLT: "BLT",
+	BGT: "BGT", LOAD: "LOAD", STORE: "STORE", LDD: "LDD", STRD: "STRD",
+	LDB: "LDB", LDSB: "LDSB", STRB: "STRB", MRET: "MRET", SYSCALL: "SYSCALL",
+}
+
+// anchorMnemonic reads the anchored instruction so a mismatch reports what the
+// ordinal currently names, not only its expected and observed literals.
+func (f *kernelFixture) anchorMnemonic(p layoutProbe) string {
+	base, ok := f.labels[p.anchor.label]
+	if !ok {
+		return "<missing>"
+	}
+	physical := f.phys(base + uint32(p.anchor.ordinal)*4)
+	op := f.m.getOpcode(binary.BigEndian.Uint32(f.m.memory[physical:]))
+	if name, ok := opcodeMnemonics[op]; ok {
+		return name
+	}
+	return fmt.Sprintf("opcode(%d)", op)
 }
 
 type probeKind uint8
@@ -142,10 +171,12 @@ var kernelRelocations = []layoutProbe{
 }
 
 // kernelNonRelocations are values that must survive a layout move unchanged.
+// The kernel-page threshold is pinned by runMapPage on user exhaustion, where
+// map_page computes K0 itself; feeding K0 through a probe prepare would be
+// self-fed and would not test the production shift input.
 var kernelNonRelocations = []layoutProbe{
-	{name: "kernel.boundary", anchor: relocationAnchor{"schedule", 2}, want: 0xC0000000, kind: probeRegister, register: w8},
+	{name: "kernel.boundary", anchor: relocationAnchor{"schedule", 2}, want: kernelBoundary, kind: probeRegister, register: w8},
 	{name: "page_table.entries", anchor: relocationAnchor{"fork_copy_regs_done", 28}, start: 26, want: 786432, kind: probeRegister, register: w3},
-	{name: "kernel_page.threshold", anchor: relocationAnchor{"map_page", 77}, start: 76, want: 0xC0000, kind: probeRegister, register: w1, prepare: registerProbe(k0, kernelBoundary)},
 }
 
 func (f *kernelFixture) snapshotRegisters() map[Register]uint32 {
@@ -202,8 +233,8 @@ func (f *kernelFixture) runLayoutProbe(snapshot map[Register]uint32, p layoutPro
 // layoutMismatch returns the same text verifyLayoutProbe reports for got, so
 // the in-process self-test can assert the diagnostic path without failing.
 func (f *kernelFixture) layoutMismatch(p layoutProbe, got uint32) string {
-	return fmt.Sprintf("relocation %s anchor=%s: expected %#x got %#x: %s",
-		p.name, p.anchor, p.want, got, f.diagnosticText("relocation literal mismatch"))
+	return fmt.Sprintf("relocation %s anchor=%s [%s]: expected %#x got %#x: %s",
+		p.name, p.anchor, f.anchorMnemonic(p), p.want, got, f.diagnosticText("relocation literal mismatch"))
 }
 
 func (f *kernelFixture) verifyLayoutProbe(snapshot map[Register]uint32, p layoutProbe) {
@@ -309,6 +340,7 @@ func TestKernelControlRelocationMismatchDiagnostic(t *testing.T) {
 			for _, want := range []string{
 				"relocation " + p.name,
 				"anchor=" + p.anchor.String(),
+				"[" + f.anchorMnemonic(p) + "]",
 				fmt.Sprintf("expected %#x", p.want),
 				fmt.Sprintf("got %#x", got),
 				"relocation literal mismatch",
@@ -323,6 +355,8 @@ func TestKernelControlRelocationMismatchDiagnostic(t *testing.T) {
 }
 
 func TestKernelControlNonRelocationTable(t *testing.T) {
+	// Single literal oracle for the named boundary; every other test uses
+	// kernelBoundary rather than repeating the C.R.U.
 	if kernelBoundary != 0xC0000000 {
 		t.Fatalf("kernel boundary = %#x, want #0xC0000000", kernelBoundary)
 	}
@@ -467,14 +501,28 @@ func (f *kernelFixture) prepareFrameSelection() {
 	f.m.registers[uptr] = frameSelectionUPTR
 }
 
+// kernelPageThreshold is map_page's first kernel frame id, K0 >> 12. It is
+// computed by the executed map_page, not supplied through a probe prepare.
+const kernelPageThreshold = kernelBoundary / pageSize
+
 // runMapPage executes the real map_page for one user page id and stops at its
-// returning JMPR. found is false when map_page reports allocation failure.
+// returning JMPR. Failure must be exactly W9==1, must not dirty the bitmap,
+// pages_used or target PTE, and must still expose map_page's own threshold in
+// W1. Only user pages are requested, so the kernel-page failure JUMP #0
+// (sackOS/kernel.asm:2422) is intentionally not covered here.
 func (f *kernelFixture) runMapPage(page uint32) (frame uint32, found bool) {
 	f.t.Helper()
 	start, ok := f.labels["map_page"]
 	if !ok {
 		f.t.Fatal("missing label map_page")
 	}
+	table := f.m.registers[uptr]
+	pagesUsedBefore := f.get(table - 4)
+	pteAddr := table + page*4
+	pteBefore := f.get(pteAddr)
+	bitmapBytes := (f.frameCount() + 31) / 32 * 4
+	bitmapBefore := f.snapshotRegion("map_page.bitmap", uint32(BitmapStart), bitmapBytes)
+
 	const returnSentinel = ^uint32(0)
 	f.phase = "map_page"
 	f.m.registers[pc] = kernelBoundary + start
@@ -487,10 +535,28 @@ func (f *kernelFixture) runMapPage(page uint32) (frame uint32, found bool) {
 	if got := f.m.registers[pc]; got != returnSentinel {
 		f.t.Fatalf("map_page returned to %#x, want sentinel %#x", got, returnSentinel)
 	}
-	if f.m.registers[w9] != 0 {
+	switch f.m.registers[w9] {
+	case 0:
+		return f.m.registers[w7] & pteFrameMask, true
+	case 1:
+		if got := f.m.registers[w1]; got != kernelPageThreshold {
+			f.t.Fatalf("map_page threshold W1=%#x, want %#x", got, kernelPageThreshold)
+		}
+		if got := f.get(table - 4); got != pagesUsedBefore {
+			f.t.Fatalf("map_page failure dirtied pages_used: %#x -> %#x", pagesUsedBefore, got)
+		}
+		if got := f.get(pteAddr); got != pteBefore {
+			f.t.Fatalf("map_page failure dirtied PTE %#x: %#x -> %#x", pteAddr, pteBefore, got)
+		}
+		bitmapAfter := f.snapshotRegion("map_page.bitmap", uint32(BitmapStart), bitmapBytes)
+		if err := f.diffRegion(bitmapBefore, bitmapAfter, nil); err != nil {
+			f.t.Fatalf("map_page failure dirtied bitmap: %v", err)
+		}
+		return 0, false
+	default:
+		f.t.Fatalf("map_page W9=%d, want 0 (success) or 1 (user failure)", f.m.registers[w9])
 		return 0, false
 	}
-	return f.m.registers[w7] & (isPteMappedMask - 1), true
 }
 
 // TestKernelControlFrameSelection shapes the bitmap, then executes map_page and
@@ -499,6 +565,7 @@ func TestKernelControlFrameSelection(t *testing.T) {
 	cases := []struct {
 		name  string
 		exact bool // exactly len(want)-1 free bits must remain before allocation
+		guard bool // leave the bit at frameCount free and require it stays free
 		shape func(*kernelFixture) []uint32
 	}{
 		{
@@ -518,6 +585,17 @@ func TestKernelControlFrameSelection(t *testing.T) {
 			},
 		},
 		{
+			name:  "last valid frame with free guard bit",
+			exact: true,
+			guard: true,
+			shape: func(f *kernelFixture) []uint32 {
+				first := f.firstFreeFrame()
+				last := f.frameCount() - 1
+				f.reserveFrames(first, last-first)
+				return []uint32{last, frameSelectionNone}
+			},
+		},
+		{
 			name:  "hole before first free",
 			exact: true,
 			shape: func(f *kernelFixture) []uint32 {
@@ -534,6 +612,9 @@ func TestKernelControlFrameSelection(t *testing.T) {
 			f := newKernelFixture(t)
 			f.prepareFrameSelection()
 			want := c.shape(f)
+			if c.guard && f.frameReserved(f.frameCount()) {
+				t.Fatalf("%s: frameCount bit %d was pre-reserved", c.name, f.frameCount())
+			}
 			if c.exact {
 				if free := f.freeFrameCount(); free != uint32(len(want)-1) {
 					t.Fatalf("%s: free bits = %d, want %d", c.name, free, len(want)-1)
@@ -554,6 +635,9 @@ func TestKernelControlFrameSelection(t *testing.T) {
 					t.Fatalf("%s: allocated frame %d is still free in the bitmap", c.name, frame)
 				}
 			}
+			if c.guard && f.frameReserved(f.frameCount()) {
+				t.Fatalf("%s: map_page touched frame %d beyond frameCount", c.name, f.frameCount())
+			}
 		})
 	}
 }
@@ -562,10 +646,11 @@ func TestKernelControlFrameSelection(t *testing.T) {
 //
 // enterException raises a cause through the real m.exception path and uses the
 // shared runner to reach the handler, so handler entry is never faked by
-// writing PC. input_int then initializes the new PCB with PC=0, SP=0xC0000000
-// and SR=56 (sackOS/kernel.asm:514-533); schedule restores those fields and
-// MRET publishes them to the CPU. F2-18 (zesh#34) expects the same post-exec
-// context. The compact fixture keeps KPTR in fixtureKPTR and maps BitmapStart
+// writing PC. input_int then initializes the new PCB with PC=0,
+// SP=kernelBoundary and SR=56 (sackOS/kernel.asm:514-533); schedule restores
+// those fields and MRET publishes them to the CPU. F2-18 (zesh#34) expects
+// the same post-exec context. The compact fixture keeps KPTR in fixtureKPTR
+// and maps BitmapStart
 // through it, so map_page's bitmap literal resolves without a literal patch.
 const (
 	controlMemoryBytes    = 48 << 20
@@ -630,10 +715,10 @@ func (f *kernelFixture) assertUserEntry(pid uint32) {
 		want uint32
 	}{
 		{"PCB.PC", f.get(pcb + PCBProgramCounterOffset), 0},
-		{"PCB.SP", f.get(pcb + PCBStackPointerOffset), 0xC0000000},
+		{"PCB.SP", f.get(pcb + PCBStackPointerOffset), kernelBoundary},
 		{"PCB.SR", f.get(pcb + PCBStatusRegisterOffset), 56},
 		{"PC", f.m.registers[pc], 0},
-		{"SP", f.m.registers[sp], 0xC0000000},
+		{"SP", f.m.registers[sp], kernelBoundary},
 		{"SR", f.m.registers[sr], 56},
 	} {
 		if check.got != check.want {
