@@ -307,6 +307,10 @@ const (
 	asmKernelStackBottom = uint32(KernelStackStart) + KernelVirtualOffset
 	asmStatusAddr        = uint32(ControlRegionStart) + ControlStatusOffset // physical 0x3FFD0100
 	asmHandlerBudget     = 500_000
+	// kill runs page_release before any lifecycle change: one read-only pass
+	// over the whole 0xC0000-entry user table (about 3.1 million instructions)
+	// and a release pass that stops after PID 0's single page.
+	asmKillBudget = 5_000_000
 )
 
 // asmSetupRun is a machine with the runner's minimum backing on which the real
@@ -562,7 +566,7 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 	m.exception(killInt)
 	loop := kernelBoundary + r.k.label(t, "loop")
 	stack.begin()
-	s.run("kill_int", asmHandlerBudget, func(Instruction, uint32) bool { return m.registers[pc] == loop })
+	s.run("kill_int", asmKillBudget, func(Instruction, uint32) bool { return m.registers[pc] == loop })
 	stack.check(t, "kill_int")
 	if got := physWord(m, bitWord); got&1 != 0 {
 		t.Fatalf("bitmap word %#x = %#x after kill, want bit 0 clear", bitWord, got)

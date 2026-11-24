@@ -241,7 +241,17 @@ schedule()
 # Helper functions
 
 ## kill(pid)
+**pid is on W9 (unchanged entry contract)**
+
+Cleanup runs first, before any lifecycle effect. W0 keeps the pid across the
+helper call, because W9 becomes the helper result.
 ```
+SP = kernel_stack_pointer   // the interrupted SP is already saved in the PCB
+x = page_release(&pcb_v[pid], &pcb_v[pid].page_table)
+if x != 0:
+  kill_cleanup_panic        // W9 = 5, W0 = pid; nothing released or changed
+W9 = pid
+
 parent = pcb_v[pid].parent_pid
 if parent != -1:
   if pcb_v[parent].is_waiting:
@@ -274,12 +284,92 @@ while curr_child != -1:
   next = pcb_v[curr_child].next_sibling
   pcb_v[curr_child].next_sibling = -1
   curr_child = next
- 
-free every page from page table couting till pcb_v[pid].pages_used == 0
-(use two pointers to unmap from both memory ends, unmapping the stack efficiently)
 
 schedule()
 ```
+
+`kill_cleanup_panic` is a labeled self-jump reached only from this branch.
+W9 = 5 means the kernel's page accounting is already corrupt (a kernel bug or
+an external RAM write), so the kernel stops instead of scheduling. kill runs
+in exception context with interrupts disabled, so the CPU stays at the label
+until the machine is restarted. The target's PTEs, bitmap bits, pages_used,
+flags, family links and the parent's status/readiness are left unchanged for
+inspection.
+
+## page_release(pcb, page_table)
+**W7 = target PCB kernel virtual address**
+**W6 = target page-table kernel virtual address (must be W7 + 80)**
+**return address is on W8 (return with JMPR W8)**
+**return on W9: 0 if every user page was released, 5 if invalid layout, count or frame**
+
+Returning helper: it never calls kill or schedule and does not depend on
+running_pid or on the active UPTR, so it can clean a nonrunning or partially
+built process.
+
+Execution preconditions: kernel mode, MMU enabled, interrupts disabled,
+SP pointing to a mapped kernel stack with at least 48 free bytes below it, and
+no concurrent writer to the target table or the bitmap.
+
+Preserved: W0-W4, W8, K0, K1, UPTR, KPTR, SP, ECR, ESA, ESR, EPC, EFA and the
+SR bits other than the comparison flags. Clobbered: W5, W6, W7, W9 and the
+comparison flags. Process identity, family links, flags, saved registers,
+status memory and scheduling state are never written.
+
+Stack: the prologue pushes W0-W4, K0, K1 and reserves 5 local words (48 bytes
+in total, descending); every return pops the same 48 bytes.
+
+Traversal: both phases walk the table in blocks of 4 PTEs from both ends (low
+block [low, low+3], high block [high-3, high]). Because the table has
+0xC0000 = 8 * 0x18000 entries, the two blocks never overlap and the pointers
+cross exactly, so every PTE is visited at most once per phase. A block is
+skipped when the OR of its 4 PTEs has no valid bit; otherwise its entries are
+handled one by one. Phase 1 always walks the whole table; phase 2 stops as soon
+as the remaining count is 0.
+```
+if pcb is not the exact base of a slot < min(MAX_PROCESSES, 256)
+   or page_table != pcb + 80:
+  return 5
+
+// phase 1: read-only preflight, low and high blocks over all 0xC0000 PTEs
+valid = 0
+low = 0, high = 0xBFFFF
+while low <= high:              // unsigned; blocks never overlap, stop on crossing
+  if any pte[low..low+3] is valid: check each of them
+  if any pte[high-3..high] is valid: check each of them
+  low += 4, high -= 4
+
+check(i): if pte[i] is valid:
+  valid++
+  frame = pte[i].frame
+  if frame >= frame_count (memory_size / 4KB, 0 means 4GB): return 5
+  if frame < 0x40000 (reserved, covers every kernel mapping): return 5
+  if bitmap[frame] == 0 (already free): return 5
+
+if valid != pages_used: return 5     // both directions, also 0 with valid PTEs
+
+// phase 2: release, same bounded block traversal, stopped when pages_used == 0
+while low <= high and pages_used != 0: ...
+release(i): if pte[i] is valid:
+  if pages_used == 0: return 5       // unexpected after preflight, no underflow
+  bitmap[frame] &= ~(1 << bit)        // clears only this bit
+  pte[i] = 0
+  pages_used = pages_used - 1        // persisted at pcb + 76
+
+if pages_used != 0: return 5
+return 0
+```
+A detected failure in phase 1 leaves PTEs, bitmap and pages_used unchanged.
+Duplicate frames are not detected, neither inside the target table nor
+shared with another process: the allocator never creates them (map_page only
+hands out free frames and fork copies user pages), and releasing the same
+frame twice inside one table is harmless (the AND clear is idempotent and the
+count check still applies). This follows xv6 (`kernel/vm.c:uvmunmap`), which
+trusts the allocator and only panics on an unmapped entry.
+
+Cost: phase 1 reads the whole 0xC0000-entry table (about 3.1 million
+instructions), independently of the number of pages. Phase 2 stops at the last
+valid PTE, so it only reaches the middle of the table when a page lives there
+(about 3.4 million more in that worst case).
 
 ## schedule()
 ```

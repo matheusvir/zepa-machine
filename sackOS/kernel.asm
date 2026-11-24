@@ -1692,6 +1692,43 @@ rele:
 
 kill:
 
+  ; Release the target's user pages before any lifecycle effect (F2-02).
+  ; W0 keeps the PID across page_release, which preserves W0-W4.
+  MV W0, #0
+  ADD W0, W9, W0          ; W0 = pid
+
+  MV K0, #0xC000
+  MV W1, #16
+  SHL K0, K0, W1          ; K0 = 0xC0000000
+
+  MV W1, #0x4018          ; #0x4018 kernel_stack_pointer
+  ADD W1, K0, W1
+  LOAD SP, W1             ; SP = kernel stack (the interrupted SP is saved in the PCB)
+
+  MV W1, #0x30
+  MV W2, #16
+  SHL W1, W1, W2
+  MV W2, #0x50
+  ADD W1, W1, W2          ; W1 = pcb_size
+  MUL W7, W1, W9
+  MV W2, #0x4024          ; #0x4024 pcb_vector
+  ADD W2, K0, W2
+  ADD W7, W2, W7          ; W7 = pcb_v[pid] virtual address
+  MV W6, #80
+  ADD W6, W7, W6          ; W6 = pcb_v[pid].page_table virtual address
+
+  MV W1, #4
+  ADD W8, PC, W1          ; W8 = return address
+  JUMP page_release
+
+  MV W1, #0
+  CMP W9, W1
+  BEQ #2
+  JUMP kill_cleanup_panic ; W9 = 5: corrupt metadata, stop before lifecycle effects
+
+  MV W1, #0
+  ADD W9, W0, W1          ; W9 = pid again for the lifecycle code below
+
   ; K0 = kernel boundary = 0xC0000000
   MV K0, #0xC000
   MV W1, #16
@@ -1862,121 +1899,16 @@ kill:
 
 
   orphanize_end:
-    ; MV sign-extends #0x9024 to 0xFFFF9024 (-0x6FDC), so the high half is
-    ; 0x3011, not 0x3010: 0x30110000 - 0x6FDC = 0x30109024. Do not "fix" it.
-    MV W0, #0x3011
-    MV W1, #16
-    SHL W0, W0, W1
-    MV W1, #0x9024
-    ADD W0, W0, W1      ; W0 = 0x30109024 bitmap physical address
-
-    ADD W0, K0, W0      ; W0 = bitmap virtual address
-
-    MV W1, #72
-    ADD W1, W2, W1      ; W1 = pcb_v[pid].pages_used address
-    LOAD W2, W1         ; W2 = pcb_v[pid].pages_used
-
-    MV W3, #4
-    ADD W3, W1, W3      ; W3 = pcb_v[pid].page_table first address (pointer i)
-    
-    MV W4, #0x30
-    MV W5, #16
-    SHL W4, W4, W5      ; W4 = 3MB
-    MV W5, #4
-    SUB W4, W4, W5      ; W4 = 3MB - 1B
-    ADD W4, W4, W3      ; W4 = pcb_v[pid].page_table last address (pointer j)
-
-    MV W5, #1
-    MV W6, #20
-    SHL W5, W5, W6      ; W5 = mask of valid (bit 20)
-
-    MV W6, #1
-    MV W7, #20
-    SHL W6, W6, W7
-    MV W7, #1
-    SUB W6, W6, W7      ; W6 = mask of page frame id (bits 0-19) 2^20 - 1
-
-    kill_free_memory_loop:
-      MV W7, #0
-      CMP W2, W7
-      BEQ kill_end      ; while pages_used != 0
-
-      LOAD W7, W3       ; W7 = pte_i
-      AND W8, W7, W5    ; W8 = pte_i.valid
-      CMP W8, W5
-      BLT kill_skip_i   ; if pte_i is valid, enter block
-
-        MV W8, #0
-        STORE W8, W3    ; set pte_i invalid
-
-        AND W8, W7, W6  ; W8 = pte_i.page_frame_id
-        
-        ; unmap the bitmap
-        MV W9, #-5          ; W9 = -5
-        SHL W9, W8, W9      ; W9 = word offset (W8 >> 5)
-        
-        MV W7, #2
-        SHL W9, W9, W7      ; W9 = byte address offset (W9 * 4)
-
-        ADD W9, W0, W9      ; W9 = address of the word in the bitmap
-        
-        MV W7, #31
-        AND W8, W8, W7      ; W8 = bit index (0 to 31)
-        
-        MV W7, #1
-        SHL W7, W7, W8      ; W7 = 1 << bit_index (clear mask)
-        
-        LOAD W8, W9         ; Load bitmap word into W8
-        XOR W8, W8, W7      ; Clear the frame's bit
-        STORE W8, W9        ; Store the updated word back to memory
-        
-        MV W7, #1
-        SUB W2, W2, W7      ; W2 = W2 - 1 (pages_used--)
-
-      kill_skip_i:
-
-      LOAD W7, W4       ; W7 = pte_j
-      AND W8, W7, W5    ; W8 = pte_j.valid
-      CMP W8, W5
-      BLT kill_skip_j   ; if pte_j is valid, enter block
-
-        MV W8, #0
-        STORE W8, W4    ; set pte_j invalid
-
-        AND W8, W7, W6  ; W8 = pte_j.page_frame_id
-        
-        ; unmap the bitmap
-        MV W9, #-5          ; W9 = -5
-        SHL W9, W8, W9      ; W9 = word offset (W8 >> 5)
-        
-        MV W7, #2
-        SHL W9, W9, W7  
-
-        ADD W9, W0, W9      ; W9 = address of the word in the bitmap
-        
-        MV W7, #31
-        AND W8, W8, W7      ; W8 = bit index (0 to 31)
-        
-        MV W7, #1
-        SHL W7, W7, W8      ; W7 = 1 << bit_index (clear mask)
-        
-        LOAD W8, W9         ; Load bitmap word into W8
-        XOR W8, W8, W7      ; Clear the frame's bit
-        STORE W8, W9        ; Store the updated word back to memory
-        
-        MV W7, #1
-        SUB W2, W2, W7      ; W2 = W2 - 1 (pages_used--)
-
-      kill_skip_j:
-
-      MV W7, #4
-      ADD W3, W3, W7        ; pte_i += 1
-      SUB W4, W4, W7        ; pte_j -= 1
-
-      JUMP kill_free_memory_loop
-
-  kill_end:
+    ; user pages were already released by page_release at kill entry
     JUMP schedule
+
+
+kill_cleanup_panic:
+  ; F2-02 invariant panic: page_release returned W9 = 5 for the PID in W0.
+  ; Nothing was released and no lifecycle state was changed. kill runs in
+  ; exception context with interrupts disabled, so the CPU stays here until
+  ; the machine is restarted. Reached only from kill.
+  JUMP kill_cleanup_panic
 
 
 schedule:
@@ -2492,3 +2424,486 @@ map_page:
     map_frame_not_found_user:
       MV W9, #1
       JMPR W8   ; return
+
+; ---------------------------------------------------------------------------
+; page_release: returning user-page release helper (F2-02, zesh#18)
+;
+; In:  W7 = target PCB kernel virtual address
+;      W6 = target page-table kernel virtual address (must be W7 + 80)
+;      W8 = kernel continuation, returned to with JMPR W8
+;      SP = mapped kernel stack (descending), at least 48 free bytes below it
+; Out: W9 = 0 all user pages released, pages_used = 0
+;      W9 = 5 invalid layout, count or frame; nothing was released
+; Preserves W0-W4, W8, K0, K1, UPTR, KPTR, SP, exception registers and the
+; non-comparison SR bits. Clobbers W5, W6, W7, W9 and the comparison flags.
+; Never touches process identity, family links, flags, saved context,
+; status memory or scheduling state.
+;
+; Stack frame after the prologue (48 bytes):
+;   SP+0  scratch: address of the PTE being checked
+;   SP+4  bitmap kernel virtual address
+;   SP+8  address of target pages_used (PCB + 76)
+;   SP+12 return address of page_release_check4 / page_release_one4
+;   SP+16 unused (kept so the frame size stays 48 bytes)
+;   SP+20 K1, SP+24 K0, SP+28 W4, SP+32 W3, SP+36 W2, SP+40 W1, SP+44 W0
+; Working registers: W0 = table base, W1 = low block address,
+;   W2 = high block top address, W3 = valid count (phase 1) / remaining
+;   count (phase 2), W4 = valid-bit mask, W9 = 4 in the scan loops,
+;   K0 = number of physical frames, K1 = internal link.
+;
+; Traversal: both phases walk the table in blocks of 4 PTEs from both ends.
+; The low block is [W1, W1+12], the high block is [W2-12, W2]. The table has
+; 0xC0000 = 8 * 0x18000 entries, so the two blocks never overlap and the
+; pointers cross exactly (W1 > W2) after 0x18000 iterations: every PTE is
+; visited at most once per phase. A block whose OR has no valid bit is skipped;
+; only blocks containing a valid PTE are examined entry by entry.
+; Phase 1 always walks the whole table, because a count that is lower than the
+; number of valid PTEs can only be detected there. Phase 2 stops as soon as the
+; remaining count is 0: phase 1 already proved that no valid PTE is left, so
+; its cost does not depend on the number of pages.
+; Duplicate frames inside the table are not checked: map_page only hands out
+; free frames, and releasing the same frame twice is harmless (the AND clear is
+; idempotent and the count check still applies). Like xv6 uvmunmap, the helper
+; trusts the allocator for this and checks only what can corrupt other owners.
+; ---------------------------------------------------------------------------
+page_release:
+  MV W9, #4
+  SUB SP, SP, W9
+  STORE W0, SP
+  SUB SP, SP, W9
+  STORE W1, SP
+  SUB SP, SP, W9
+  STORE W2, SP
+  SUB SP, SP, W9
+  STORE W3, SP
+  SUB SP, SP, W9
+  STORE W4, SP
+  SUB SP, SP, W9
+  STORE K0, SP
+  SUB SP, SP, W9
+  STORE K1, SP
+  MV W9, #20
+  SUB SP, SP, W9          ; five local slots
+
+  MV W5, #0xC000
+  MV W9, #16
+  SHL W5, W5, W9          ; W5 = kernel boundary 0xC0000000
+
+  ; W7 must be the exact base of a PCB slot below max_processes
+  MV W0, #0x4024          ; #0x4024 pcb_vector
+  ADD W0, W5, W0          ; W0 = pcb_v virtual address
+  CMP W7, W0
+  BLT page_release_fail
+
+  SUB W1, W7, W0          ; W1 = byte offset into pcb_v
+  MV W2, #0x30
+  MV W9, #16
+  SHL W2, W2, W9
+  MV W9, #0x50
+  ADD W2, W2, W9          ; W2 = pcb_size 0x300050
+  UDIV W3, W1, W2         ; W3 = slot index
+  MUL W4, W3, W2
+  CMP W4, W1
+  BEQ #2
+  JUMP page_release_fail  ; not aligned to a PCB base
+
+  MV W4, #0x4000          ; #0x4000 max_processes
+  ADD W4, W5, W4
+  LOAD W4, W4
+  CMP W3, W4
+  BLT #2
+  JUMP page_release_fail  ; slot index >= max_processes
+  MV W4, #256
+  CMP W3, W4
+  BLT #2
+  JUMP page_release_fail  ; slot beyond the reserved PCB vector
+
+  MV W4, #80
+  ADD W4, W7, W4
+  CMP W6, W4
+  BEQ #2
+  JUMP page_release_fail  ; W6 is not this PCB's page table
+
+  MV W4, #76
+  ADD W4, W7, W4          ; W4 = &pages_used
+  MV W9, #8
+  ADD W9, SP, W9
+  STORE W4, W9            ; SP+8 = &pages_used
+
+  ; MV sign-extends #0x9024 to 0xFFFF9024 (-0x6FDC), so the high half is
+  ; 0x3011, not 0x3010: 0x30110000 - 0x6FDC = 0x30109024. Do not "fix" it.
+  MV W4, #0x3011
+  MV W9, #16
+  SHL W4, W4, W9
+  MV W9, #0x9024
+  ADD W4, W4, W9          ; W4 = 0x30109024 = bitmap physical address
+  ADD W4, W5, W4          ; W4 = bitmap virtual address
+  MV W9, #4
+  ADD W9, SP, W9
+  STORE W4, W9            ; SP+4 = bitmap
+
+  ; K0 = number of physical frames (memory_size 0 encodes 4 GiB)
+  MV K0, #0x400C          ; #0x400C memory_size
+  ADD K0, W5, K0
+  LOAD K0, K0
+  MV W9, #0
+  CMP K0, W9
+  BEQ page_release_mem_4gb
+  MV W9, #-12
+  SHL K0, K0, W9
+  JUMP page_release_mem_done
+  page_release_mem_4gb:
+    MV K0, #1
+    MV W9, #20
+    SHL K0, K0, W9        ; 0x100000 frames
+  page_release_mem_done:
+
+  MV W0, #0
+  ADD W0, W6, W0          ; W0 = table base
+
+  ; Phase 1: read-only preflight of the whole table, from both ends
+  MV W1, #0
+  ADD W1, W0, W1          ; W1 = first low block
+  MV W2, #0x30
+  MV W9, #16
+  SHL W2, W2, W9
+  MV W9, #4
+  SUB W2, W2, W9
+  ADD W2, W0, W2          ; W2 = last PTE address (index 0xBFFFF)
+  MV W3, #0               ; W3 = valid PTEs seen
+  MV W4, #1
+  MV W9, #20
+  SHL W4, W4, W9          ; W4 = valid-bit mask (bit 20)
+  MV W9, #4               ; W9 = PTE step
+
+  page_release_pre_loop:
+    CMP W1, W2
+    BGT page_release_pre_done   ; low crossed high: every entry visited once
+
+    LOAD W5, W1                 ; OR of the low block
+    ADD W7, W1, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    ADD W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    ADD W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    AND W5, W5, W4
+    CMP W5, W4
+    BLT page_release_pre_high   ; no valid PTE in the low block
+    MV W5, #0
+    ADD W5, W1, W5              ; W5 = low block base
+    MV K1, #4
+    ADD K1, PC, K1
+    JUMP page_release_check4
+
+  page_release_pre_high:
+    LOAD W5, W2                 ; OR of the high block
+    SUB W7, W2, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    SUB W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    SUB W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    AND W5, W5, W4
+    CMP W5, W4
+    BLT page_release_pre_step   ; no valid PTE in the high block
+    MV W5, #12
+    SUB W5, W2, W5              ; W5 = high block base
+    MV K1, #4
+    ADD K1, PC, K1
+    JUMP page_release_check4
+
+  page_release_pre_step:
+    MV W5, #16
+    ADD W1, W1, W5
+    SUB W2, W2, W5
+    JUMP page_release_pre_loop
+
+  page_release_pre_done:
+  MV W9, #8
+  ADD W9, SP, W9
+  LOAD W9, W9
+  LOAD W9, W9             ; W9 = persisted pages_used
+  CMP W3, W9
+  BEQ #2
+  JUMP page_release_fail  ; count disagrees with the table (either direction)
+
+  ; Phase 2: release with the same traversal; W3 = remaining count
+  MV W1, #0
+  ADD W1, W0, W1
+  MV W2, #0x30
+  MV W9, #16
+  SHL W2, W2, W9
+  MV W9, #4
+  SUB W2, W2, W9
+  ADD W2, W0, W2
+  MV W9, #4               ; W4 still holds the valid-bit mask
+
+  page_release_rel_loop:
+    MV W5, #0
+    CMP W3, W5
+    BEQ page_release_rel_done   ; count is 0: phase 1 proved no valid PTE is left
+    CMP W1, W2
+    BGT page_release_rel_done
+
+    LOAD W5, W1
+    ADD W7, W1, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    ADD W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    ADD W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    AND W5, W5, W4
+    CMP W5, W4
+    BLT page_release_rel_high
+    MV W5, #0
+    ADD W5, W1, W5
+    MV K1, #4
+    ADD K1, PC, K1
+    JUMP page_release_one4      ; release the low block
+
+  page_release_rel_high:
+    LOAD W5, W2
+    SUB W7, W2, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    SUB W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    SUB W7, W7, W9
+    LOAD W6, W7
+    OR W5, W5, W6
+    AND W5, W5, W4
+    CMP W5, W4
+    BLT page_release_rel_step
+    MV W5, #12
+    SUB W5, W2, W5
+    MV K1, #4
+    ADD K1, PC, K1
+    JUMP page_release_one4      ; release the high block
+
+  page_release_rel_step:
+    MV W5, #16
+    ADD W1, W1, W5
+    SUB W2, W2, W5
+    JUMP page_release_rel_loop
+
+  page_release_rel_done:
+  MV W9, #8
+  ADD W9, SP, W9
+  LOAD W9, W9
+  LOAD W9, W9             ; W9 = persisted pages_used after release
+  MV W5, #0
+  CMP W9, W5
+  BEQ #2
+  JUMP page_release_fail  ; unexpected after preflight: never report success
+  MV W9, #0
+  JUMP page_release_return
+
+  page_release_fail:
+    MV W9, #5
+
+  page_release_return:
+    MV W5, #20
+    ADD SP, SP, W5        ; drop local slots
+    MV W5, #4
+    LOAD K1, SP
+    ADD SP, SP, W5
+    LOAD K0, SP
+    ADD SP, SP, W5
+    LOAD W4, SP
+    ADD SP, SP, W5
+    LOAD W3, SP
+    ADD SP, SP, W5
+    LOAD W2, SP
+    ADD SP, SP, W5
+    LOAD W1, SP
+    ADD SP, SP, W5
+    LOAD W0, SP
+    ADD SP, SP, W5
+    JMPR W8               ; return to the caller's continuation
+
+
+; page_release_check4 / page_release_one4: run page_release_check or
+; page_release_one on the 4 PTEs starting at W5 (lowest address first).
+; In: W5 = block base, K1 = return address. On return W4 = valid-bit mask
+; and W9 = 4 again, as the scan loops expect. Uses SP+12.
+page_release_check4:
+  MV W9, #12
+  ADD W9, SP, W9
+  STORE K1, W9            ; SP+12 = return address
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_check ; entry 0
+  MV W9, #4
+  ADD W5, W5, W9
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_check ; entry 1
+  MV W9, #4
+  ADD W5, W5, W9
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_check ; entry 2
+  MV W9, #4
+  ADD W5, W5, W9
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_check ; entry 3
+  JUMP page_release_block_return
+
+page_release_one4:
+  MV W9, #12
+  ADD W9, SP, W9
+  STORE K1, W9            ; SP+12 = return address
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_one   ; entry 0
+  MV W9, #4
+  ADD W5, W5, W9
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_one   ; entry 1
+  MV W9, #4
+  ADD W5, W5, W9
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_one   ; entry 2
+  MV W9, #4
+  ADD W5, W5, W9
+  MV K1, #4
+  ADD K1, PC, K1
+  JUMP page_release_one   ; entry 3
+
+page_release_block_return:
+  MV W4, #1
+  MV W9, #20
+  SHL W4, W4, W9          ; W4 = valid-bit mask
+  MV W9, #12
+  ADD W9, SP, W9
+  LOAD K1, W9
+  MV W9, #4               ; W9 = PTE step
+  JMPR K1
+
+
+; page_release_check: phase-1 check of one PTE (read-only).
+; In: W5 = PTE address, K1 = return address. W5 is preserved on return.
+; Uses W4, W6, W7, W9 and SP+0.
+; Valid PTE: W3 += 1 and frame checks; any violation jumps to page_release_fail.
+page_release_check:
+  LOAD W6, W5
+  MV W7, #11
+  SHL W6, W6, W7
+  MV W7, #-11
+  SHL W6, W6, W7          ; W6 = valid bit (20) and frame id (0-19)
+  MV W7, #-20
+  SHL W7, W6, W7          ; W7 = valid bit
+  MV W9, #1
+  CMP W7, W9
+  BEQ #2
+  JMPR K1                 ; invalid PTE: nothing to check
+
+  ADD W3, W3, W9          ; one more valid PTE
+  STORE W5, SP            ; SP+0 = address of this PTE
+
+  MV W7, #12
+  SHL W7, W6, W7
+  MV W9, #-12
+  SHL W7, W7, W9          ; W7 = frame id
+  CMP W7, K0
+  BLT #2
+  JUMP page_release_fail  ; frame outside physical memory
+
+  MV W9, #4
+  MV W4, #16
+  SHL W9, W9, W4          ; W9 = 0x40000, first non-reserved frame
+  CMP W7, W9
+  BLT page_release_fail   ; reserved frame (kernel, PCBs, tables, bitmap)
+
+  MV W9, #4
+  ADD W9, SP, W9
+  LOAD W9, W9             ; W9 = bitmap address
+  MV W4, #-5
+  SHL W4, W7, W4
+  MV W5, #2
+  SHL W4, W4, W5
+  ADD W9, W9, W4
+  LOAD W9, W9             ; W9 = bitmap word holding the frame
+  MV W4, #31
+  AND W7, W7, W4          ; W7 = bit index
+  MV W4, #0
+  SUB W7, W4, W7          ; W7 = -bit index
+  SHL W9, W9, W7          ; W9 = word >> bit index
+  MV W4, #1
+  AND W9, W9, W4
+  CMP W9, W4
+  BEQ #2
+  JUMP page_release_fail  ; frame already free in the bitmap
+
+  LOAD W5, SP             ; restore the PTE address for the caller
+  JMPR K1
+
+
+; page_release_one: phase-2 release of one PTE.
+; In: W5 = PTE address, K1 = return address, W3 = remaining count.
+; Valid PTE: clear its bitmap bit (AND with complement), invalidate the PTE
+; and persist pages_used - 1. W5 is preserved. Uses W4, W6, W7, W9.
+page_release_one:
+  LOAD W6, W5
+  MV W7, #11
+  SHL W6, W6, W7
+  MV W7, #-11
+  SHL W6, W6, W7          ; W6 = valid bit and frame id
+  MV W7, #-20
+  SHL W7, W6, W7
+  MV W9, #1
+  CMP W7, W9
+  BEQ #2
+  JMPR K1                 ; invalid PTE: nothing to release
+
+  MV W7, #0
+  CMP W3, W7
+  BEQ page_release_fail   ; unexpected: count already zero, no underflow
+
+  MV W7, #12
+  SHL W6, W6, W7
+  MV W7, #-12
+  SHL W6, W6, W7          ; W6 = frame id
+
+  MV W9, #4
+  ADD W9, SP, W9
+  LOAD W9, W9             ; W9 = bitmap address
+  MV W7, #-5
+  SHL W7, W6, W7
+  MV W4, #2
+  SHL W7, W7, W4
+  ADD W9, W9, W7          ; W9 = bitmap word address
+  MV W7, #31
+  AND W6, W6, W7          ; W6 = bit index
+  MV W7, #1
+  SHL W7, W7, W6          ; W7 = 1 << bit index
+  MV W6, #-1
+  XOR W7, W7, W6          ; W7 = ~(1 << bit index)
+  LOAD W6, W9
+  AND W6, W6, W7
+  STORE W6, W9            ; clear only this frame's bit
+
+  MV W6, #0
+  STORE W6, W5            ; invalidate the PTE
+
+  MV W6, #1
+  SUB W3, W3, W6
+  MV W6, #8
+  ADD W6, SP, W6
+  LOAD W6, W6
+  STORE W3, W6            ; persist pages_used - 1
+  JMPR K1
