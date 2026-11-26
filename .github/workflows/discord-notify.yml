@@ -61,14 +61,25 @@ jobs:
               except (TypeError, ValueError):
                   return {}
 
-          def discord_id(login):
+          def discord_id(login, github_id=None):
               mapping = json_map("DISCORD_USER_MAP")
-              value = next((v for k, v in mapping.items() if str(k).casefold() == str(login).casefold()), "")
+              # All-digit keys are GitHub user IDs; every other key is a login.
+              by_id = {str(k): v for k, v in mapping.items() if re.fullmatch(r"\d+", str(k))}
+              by_login = {str(k).casefold(): v for k, v in mapping.items() if str(k) not in by_id}
+              login_key = str(login).casefold()
+              if github_id is not None and str(github_id) in by_id:
+                  value = by_id[str(github_id)]
+              elif login_key in by_login:
+                  value = by_login[login_key]
+              elif github_id is None and by_id:
+                  value = by_id.get(str(user_lookup(login)), "")
+              else:
+                  value = ""
               value = str(value)
               return value if re.fullmatch(r"\d{17,20}", value) else None
 
-          def mention(login):
-              user_id = discord_id(login)
+          def mention(login, github_id=None):
+              user_id = discord_id(login, github_id)
               return (f"<@{user_id}>", user_id) if user_id else ("", None)
 
           def front_lead(labels):
@@ -104,40 +115,57 @@ jobs:
                   return "\n".join(lines[i + 1:end]), True
               return body or "", False
 
+          def issue_url_ref(url):
+              parsed = urllib.parse.urlsplit(url.rstrip(".,;:!?"))
+              if parsed.scheme.casefold() != "https" or parsed.netloc.casefold() != "github.com":
+                  return None
+              match = re.fullmatch(r"/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)/?", parsed.path, re.I)
+              return (match.group(1).lower(), int(match.group(2))) if match else None
+
           def task_refs(body, current_repo):
               section, has_section = task_section(body)
-              refs = set()
               if not has_section:
-                  return refs, False
+                  return set(), False
               # Accept only explicit issue references; subtasks and Evidence are never scanned.
               task_repo = current_repo.lower()
               if task_repo == "matheusvir/zepa-machine":
                   task_repo = "matheusvir/zesh"
-              for match in re.finditer(r"(?i)\b(?:issue|refs?|closes?)\s+#(\d+)\b", section):
-                  number = int(match.group(1))
-                  refs.add((task_repo, number))
+              # Primary refs are the target immediately after a keyword.
+              primary = set()
+              keyword_target = (
+                  r"(?i)\b(?:issue|refs?|closes?)(?:\s*:\s*|\s+)"
+                  r"(?:(?P<url>https?://[^\s<>()]+)"
+                  r"|(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<qualified>\d+)\b"
+                  r"|#(?P<number>\d+)\b)"
+              )
+              for match in re.finditer(keyword_target, section):
+                  if match.group("url"):
+                      ref = issue_url_ref(match.group("url"))
+                      if ref:
+                          primary.add(ref)
+                  elif match.group("repo"):
+                      primary.add((match.group("repo").lower(), int(match.group("qualified"))))
+                  else:
+                      primary.add((task_repo, int(match.group("number"))))
+              if primary:
+                  return primary, True  # Every other mention is only context.
+              # Without a primary ref, collect loose qualified mentions.
+              loose = set()
               url_matches = list(re.finditer(r"https?://[^\s<>()]+", section, re.I))
               url_spans = [match.span() for match in url_matches]
               for match in url_matches:
-                  parsed = urllib.parse.urlsplit(match.group(0).rstrip(".,;:!?"))
-                  if parsed.scheme.casefold() != "https" or parsed.netloc.casefold() != "github.com":
-                      continue
-                  issue_url = re.fullmatch(r"/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)/?", parsed.path, re.I)
-                  if issue_url:
-                      refs.add((issue_url.group(1).lower(), int(issue_url.group(2))))
+                  ref = issue_url_ref(match.group(0))
+                  if ref:
+                      loose.add(ref)
               # GitHub's owner/repo#N shorthand is accepted only as a standalone token,
               # never by extracting a path suffix from an arbitrary URL.
               for match in re.finditer(r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b", section):
                   if any(start <= match.start() < end for start, end in url_spans):
                       continue
-                  refs.add((match.group(1).lower(), int(match.group(2))))
-              return refs, has_section
+                  loose.add((match.group(1).lower(), int(match.group(2))))
+              return loose, True
 
-          def issue_get(repo, number):
-              allowed = {os.environ.get("REPOSITORY", "").lower(), "matheusvir/zesh"}
-              if repo.lower() not in allowed or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-                  return None
-              path = "/repos/" + "/".join(urllib.parse.quote(part, safe="") for part in repo.split("/")) + f"/issues/{int(number)}"
+          def api_get(path):
               token = os.environ.get("GITHUB_TOKEN", "")
               for credential in (token, "") if token else ("",):
                   headers = {
@@ -150,27 +178,50 @@ jobs:
                   try:
                       with urllib.request.build_opener(ApiRedirectHandler).open(request, timeout=8) as response:
                           result = json.loads(response.read().decode("utf-8"))
-                      if result.get("pull_request") or int(result.get("number", -1)) != int(number):
-                          return None
-                      return result
+                      return result if isinstance(result, dict) else None
                   except urllib.error.HTTPError as error:
                       if credential and error.code in (401, 403, 404):
-                          continue  # Public cross-repo issue: retry once without credentials.
+                          continue  # Public resource: retry once without credentials.
                       return None
                   except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError):
                       return None
               return None
 
+          USER_IDS = {}
+
+          def user_lookup(login):
+              login = str(login)
+              if not re.fullmatch(r"[A-Za-z0-9-]+", login):
+                  return None
+              key = login.casefold()
+              if key not in USER_IDS:
+                  result = api_get("/users/" + urllib.parse.quote(login, safe="")) or {}
+                  valid = str(result.get("login", "")).casefold() == key and isinstance(result.get("id"), int)
+                  USER_IDS[key] = result["id"] if valid else None
+              return USER_IDS[key]
+
+          def issue_get(repo, number):
+              allowed = {os.environ.get("REPOSITORY", "").lower(), "matheusvir/zesh"}
+              if repo.lower() not in allowed or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                  return None
+              path = "/repos/" + "/".join(urllib.parse.quote(part, safe="") for part in repo.split("/")) + f"/issues/{int(number)}"
+              result = api_get(path)
+              try:
+                  if not result or result.get("pull_request") or int(result.get("number", -1)) != int(number):
+                      return None
+              except (ValueError, TypeError):
+                  return None
+              return result
+
           def resolve_issue(pr, current_repo):
               refs, _ = task_refs(pr.get("body", ""), current_repo)
-              if len({number for _, number in refs}) > 1:
+              if len(refs) > 1:
                   return None, "Ambiguous task references; no issue was selected and no user was pinged."
               if refs:
-                  matches = [(repo, issue) for repo, number in sorted(refs) if (issue := issue_get(repo, number))]
-                  if len(matches) == 1:
-                      return matches[0], None
-                  if len(matches) > 1:
-                      return None, "The reference matches issues in multiple repositories; no user was pinged."
+                  repo, number = next(iter(refs))
+                  issue = issue_get(repo, number)
+                  if issue:
+                      return (repo, issue), None
                   return None, "The referenced item could not be verified as an issue; no user was pinged."
               # Body has no explicit ref: accept a branch number only when PR and issue task codes match.
               branch = pr.get("head", {}).get("ref", "")
@@ -190,7 +241,7 @@ jobs:
                       return None, "The branch fallback matches multiple issues; no user was pinged."
               return None, "No unambiguous task issue found; no user was pinged."
 
-          def reviewer_login(issue, author):
+          def reviewer_login(issue, author, payload_users=()):
               # The Planning section precedes Description; inspect only its table row.
               lines = (issue.get("body") or "").splitlines()
               in_planning = False
@@ -214,12 +265,14 @@ jobs:
               if len(rows) != 1:
                   return None, "Planning does not have exactly one Reviewer row"
               logins = re.findall(r"(?<![\w])@([A-Za-z0-9-]+)\b", rows[0])
-              if len(logins) != 1:
-                  return None, "the Reviewer row must contain exactly one @login"
+              if not logins:
+                  return None, "the Reviewer row has no @login"
+              # The first @login is the reviewer; later ones are notes such as a sign-off.
               login = logins[0]
               if login.casefold() == str(author or "").casefold():
                   return None, "the planned reviewer is the PR author"
-              if not discord_id(login):
+              github_id = next((user.get("id") for user in payload_users if isinstance(user, dict) and str(user.get("login", "")).casefold() == login.casefold()), None)
+              if not discord_id(login, github_id):
                   return None, "the planned reviewer has no Discord ID mapping"
               return login, None
 
@@ -259,13 +312,15 @@ jobs:
                   task, warning = resolve_issue(pr, repo)
                   issue_repo, issue = task if task else (repo, None)
                   issue_url = f"https://github.com/{issue_repo}/issues/{issue['number']}" if issue else ""
-                  reviewer, reviewer_problem = reviewer_login(issue, author) if issue else (None, warning)
+                  payload_users = [(event.get("review") or {}).get("user")] + list(pr.get("requested_reviewers") or [])
+                  reviewer, reviewer_problem = reviewer_login(issue, author, payload_users) if issue else (None, warning)
                   planned = bool(reviewer)
                   if name == "pull_request_target" and action == "review_requested":
                       pass  # GitHub already delivered the request; avoid duplicate pings.
                   elif name == "pull_request_target" and action in ("opened", "reopened", "ready_for_review"):
                       if not pr.get("draft"):
-                          ping, user_id = mention(reviewer) if planned else ("", None)
+                          reviewer_id = next((user.get("id") for user in payload_users if isinstance(user, dict) and planned and str(user.get("login", "")).casefold() == reviewer.casefold()), None)
+                          ping, user_id = mention(reviewer, reviewer_id) if planned else ("", None)
                           text = f"PR #{number} {title} is ready for review (event by {actor}): {pr_url}."
                           if issue_url:
                               text += f" Task issue: {issue_url}."
@@ -280,7 +335,7 @@ jobs:
                       if state in ("approved", "changes_requested"):
                           valid_reviewer = planned and reviewer_actor.casefold() == reviewer.casefold() and reviewer_actor.casefold() != author.casefold()
                           if state == "changes_requested":
-                              ping_text, ping_id = mention(author)
+                              ping_text, ping_id = mention(author, (pr.get("user") or {}).get("id"))
                               who = clean(reviewer_actor) if valid_reviewer else f"Reviewer {clean(reviewer_actor)}"
                               text = f"{who} requested changes on PR #{number} {title}. The author should address them: {pr_url}."
                               if ping_text:
