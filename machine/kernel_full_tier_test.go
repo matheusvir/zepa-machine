@@ -12,6 +12,10 @@ import (
 // 0x30109024. The helpers below only put raw control words; they do not add a
 // mailbox token state machine.
 
+// newFullTier uses the 1 GiB + 4 KiB RunnerMinimumBackingBytes required by the
+// real setup. The backing is only sparsely touched, so focused full-tier runs
+// measured about 90 MiB max RSS for the whole go test process, and they run in
+// the normal go test path (no build tag, skip, or short-mode gate).
 func newFullTier(t *testing.T) *Machine {
 	t.Helper()
 	r := newASMSetupRun(t)
@@ -32,8 +36,10 @@ func putFullControl(m *Machine, offset, value uint32) {
 	binary.LittleEndian.PutUint32(m.memory[uint32(ControlRegionStart)+offset:], value)
 }
 
-// putFullBootstrap writes magic, version, capabilities, bases and executable
-// length first, then publishes Ready last so it trails every payload word.
+// putFullBootstrap prepares bootstrap metadata only: magic, version,
+// capabilities, bases, executable length and finally Ready. It does not write
+// the executable payload at ControlExecutableBytesOffset; F2-16 owns that
+// payload and its execution readiness.
 func putFullBootstrap(m *Machine, version, controlBase, imageBase, bufferBase uint32) {
 	off := ControlBootstrapOffset
 	putFullControl(m, off+BootstrapMagicOffset, ControlMagic)
@@ -80,6 +86,7 @@ func putFullImage(t *testing.T, m *Machine, image []byte) {
 // the bootstrap, descriptor, slots, image window and 64 KiB transfer buffer.
 func TestKernelControlFullTierRecords(t *testing.T) {
 	m := newFullTier(t)
+	// Bootstrap metadata only; the executable payload is deferred to F2-16.
 	putFullBootstrap(m, ControlProtocolVersion, uint32(ControlRegionStart), uint32(ImageWindowStart), uint32(TransferBufferStart))
 	// Payload before descriptor validity: Valid is the final descriptor word.
 	putFullImage(t, m, []byte{0x11, 0x22, 0x33, 0x44})
@@ -102,6 +109,7 @@ func TestKernelControlFullTierRecords(t *testing.T) {
 		{"bootstrap.image_base", control + ControlBootstrapOffset + BootstrapImagePhysicalOffset, uint32(ImageWindowStart)},
 		{"bootstrap.buffer_base", control + ControlBootstrapOffset + BootstrapBufferPhysicalOffset, uint32(TransferBufferStart)},
 		{"bootstrap.executable_length", control + ControlBootstrapOffset + BootstrapExecutableLengthOffset, ZEPAInstructionBytes},
+		{"bootstrap.executable_payload_unpublished", control + ControlExecutableBytesOffset, 0},
 		{"bootstrap.ready", control + ControlBootstrapOffset + BootstrapReadyOffset, 1},
 		{"descriptor.image_id", control + ControlImageDescriptorOffset + DescriptorImageIDOffset, 0x1234},
 		{"descriptor.length", control + ControlImageDescriptorOffset + DescriptorLengthOffset, 8},

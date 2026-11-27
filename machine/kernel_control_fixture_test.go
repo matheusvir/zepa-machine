@@ -123,6 +123,25 @@ func (p layoutProbe) observe(m *Machine, inst Instruction) uint32 {
 	return m.registers[p.register]
 }
 
+// Layout inventory for sackOS/kernel.asm. Each distinct construction or
+// reservation literal has one representative probe; repeated uses share it.
+//
+//	kernelRelocations: globals 0x4000..0x4020, PCB base 0x4024 and stride
+//	0x300050, KPTR 0x30009024, bitmap 0x30109024 with its 2^15-byte population
+//	span, stack top 0xFFFD0000, control region 0x3FFD0000 and status
+//	0x3FFD0100, and the map_page/page_release bitmap patches.
+//	kernelNonRelocations: kernel boundary 0xC0000000, KPTR reservation
+//	0x100000 bytes, page-table reservation 0x300000 bytes / 0xC0000 entries,
+//	PCB page-table offset 80, PCB vector cap 256, and map_page's first kernel
+//	frame 0xC0000 (pinned by runMapPage exhaustion).
+//
+// Intentionally omitted because kernel.asm has no literal or construction:
+// image window 0x3FFE0000 and transfer buffer 0x3FFF0000 (host-owned),
+// kernel-stack reservation start 0x3FFC0000 (only its top is constructed),
+// page_release's 0x18000 block count (derived), executable bootstrap payload
+// 0x200 (host/F2-16), and duplicated 3 MiB/PCB-size arithmetic in fork, fault,
+// kill and schedule paths (covered by the representative probes).
+//
 // kernelRelocations is the explicit layout relocation list. Globals are checked
 // at an instruction that carries the literal, so a missing or changed literal
 // fails even when a later computation happens to land on the right value.
@@ -157,8 +176,9 @@ var kernelRelocations = []layoutProbe{
 	// fixture cannot populate that span.
 	{name: "bitmap.extension", anchor: relocationAnchor{"setup", 48}, want: 15, kind: probeImmediate},
 
-	// Kernel stack top and control status record.
+	// Kernel stack top, control region base and status record.
 	{name: "stack.top", anchor: relocationAnchor{"setup", 64}, start: 62, want: 0xFFFD0000, kind: probeRegister, register: sp},
+	{name: "control.region.base", anchor: relocationAnchor{"setup", 70}, start: 68, want: 0x3FFD0000, kind: probeRegister, register: w0},
 	{name: "status.physical", anchor: relocationAnchor{"setup", 72}, start: 68, want: 0x3FFD0100, kind: probeRegister, register: w0},
 
 	// Executable patches: the bitmap bases after setup. kill no longer builds
@@ -176,7 +196,11 @@ var kernelRelocations = []layoutProbe{
 // self-fed and would not test the production shift input.
 var kernelNonRelocations = []layoutProbe{
 	{name: "kernel.boundary", anchor: relocationAnchor{"schedule", 2}, want: kernelBoundary, kind: probeRegister, register: w8},
+	{name: "kptr.bytes", anchor: relocationAnchor{"setup", 17}, start: 15, want: 0x100000, kind: probeRegister, register: w1},
+	{name: "page_table.bytes", anchor: relocationAnchor{"schedule", 12}, start: 10, want: 0x300000, kind: probeRegister, register: w6},
 	{name: "page_table.entries", anchor: relocationAnchor{"fork_copy_regs_done", 28}, start: 26, want: 786432, kind: probeRegister, register: w3},
+	{name: "pcb.page_table_offset", anchor: relocationAnchor{"setup", 2}, want: 80, kind: probeImmediate},
+	{name: "pcb.count", anchor: relocationAnchor{"page_release", 41}, want: 256, kind: probeImmediate},
 }
 
 func (f *kernelFixture) snapshotRegisters() map[Register]uint32 {
