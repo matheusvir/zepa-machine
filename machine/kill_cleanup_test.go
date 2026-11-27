@@ -28,7 +28,7 @@ func setFamily(f *kernelFixture, pid, parent, child, prev, next, flags uint32) {
 	f.put(p+4, child)
 	f.put(p+8, prev)
 	f.put(p+12, next)
-	f.put(p+72, flags)
+	f.put(p+PCBFlagsOffset, flags)
 }
 
 const none = ^uint32(0)
@@ -42,9 +42,9 @@ func waitingParentScene(f *kernelFixture) uint32 {
 	setFamily(f, killTarget, 0, 4, 3, 2, 9)
 	setFamily(f, 2, 0, none, 1, none, 9)
 	setFamily(f, 4, killTarget, none, none, none, 9)
-	f.put(pcbAddr(0)+16, 0x1008)      // parent status address
-	f.put(pcbAddr(0)+56, 0x11111111)  // parent saved W9
-	f.put(pcbAddr(killTarget)+56, 42) // target exit status
+	f.put(pcbAddr(0)+16, 0x1008)               // parent status address
+	f.put(pcbAddr(0)+PCBW9Offset, 0x11111111)  // parent saved W9
+	f.put(pcbAddr(killTarget)+PCBW9Offset, 42) // target exit status
 	statusFrame := f.next
 	f.next += pageSize
 	f.put(pteAddr(0, 1), isPteMappedMask|statusFrame/pageSize)
@@ -152,8 +152,8 @@ func TestKillCleanupWaitingParent(t *testing.T) {
 
 	assertTargetReleased(t, f, killPages)
 	assertCleanupFirst(t, run)
-	if f.get(pcbAddr(0)+72) != 9 || f.get(pcbAddr(0)+56) != killTarget {
-		t.Errorf("parent flags=%#x W9=%#x, want ready and child PID", f.get(pcbAddr(0)+72), f.get(pcbAddr(0)+56))
+	if f.get(pcbAddr(0)+PCBFlagsOffset) != 9 || f.get(pcbAddr(0)+PCBW9Offset) != killTarget {
+		t.Errorf("parent flags=%#x W9=%#x, want ready and child PID", f.get(pcbAddr(0)+PCBFlagsOffset), f.get(pcbAddr(0)+PCBW9Offset))
 	}
 	if got := f.m.memory[status]; got != 42 {
 		t.Errorf("delivered exit status %d, want 42", got)
@@ -161,14 +161,14 @@ func TestKillCleanupWaitingParent(t *testing.T) {
 	if f.get(pcbAddr(0)+4) != 3 || f.get(pcbAddr(3)+12) != 2 || f.get(pcbAddr(2)+8) != 3 {
 		t.Error("sibling links not repaired around the target")
 	}
-	if f.get(pcbAddr(killTarget)+72) != 8 {
-		t.Errorf("target flags %#x, want slot unmapped", f.get(pcbAddr(killTarget)+72))
+	if f.get(pcbAddr(killTarget)+PCBFlagsOffset) != 8 {
+		t.Errorf("target flags %#x, want slot unmapped", f.get(pcbAddr(killTarget)+PCBFlagsOffset))
 	}
 	assertOrphaned(t, f, 4)
 
 	allowed := cleanupAllowed(killPages)
-	for _, a := range []uint32{pcbAddr(0) + 4, pcbAddr(0) + 56, pcbAddr(0) + 72, pcbAddr(3) + 12, pcbAddr(2) + 8,
-		pcbAddr(killTarget) + 72, pcbAddr(4), pcbAddr(4) + 8, pcbAddr(4) + 12} {
+	for _, a := range []uint32{pcbAddr(0) + 4, pcbAddr(0) + PCBW9Offset, pcbAddr(0) + PCBFlagsOffset, pcbAddr(3) + 12, pcbAddr(2) + 8,
+		pcbAddr(killTarget) + PCBFlagsOffset, pcbAddr(4), pcbAddr(4) + 8, pcbAddr(4) + 12} {
 		allowed[a] = true
 	}
 	assertOnlyChanged(t, f, run.before, allowed, map[uint32]bool{status: true})
@@ -188,12 +188,12 @@ func TestKillCleanupNonwaitingParent(t *testing.T) {
 
 	assertTargetReleased(t, f, killPages)
 	assertCleanupFirst(t, run)
-	if got := f.get(pcbAddr(killTarget) + 72); got != 11 {
+	if got := f.get(pcbAddr(killTarget) + PCBFlagsOffset); got != 11 {
 		t.Errorf("target flags %#x, want mapped zombie 0xb", got)
 	}
 	assertOrphaned(t, f, 2)
 	allowed := cleanupAllowed(killPages)
-	for _, a := range []uint32{pcbAddr(killTarget) + 72, pcbAddr(2), pcbAddr(2) + 8, pcbAddr(2) + 12} {
+	for _, a := range []uint32{pcbAddr(killTarget) + PCBFlagsOffset, pcbAddr(2), pcbAddr(2) + 8, pcbAddr(2) + 12} {
 		allowed[a] = true
 	}
 	assertOnlyChanged(t, f, run.before, allowed, nil) // the parent is untouched
@@ -212,7 +212,7 @@ func TestKillCleanupParentless(t *testing.T) {
 
 	assertTargetReleased(t, f, killPages)
 	assertCleanupFirst(t, run)
-	if got := f.get(pcbAddr(killTarget) + 72); got != 8 {
+	if got := f.get(pcbAddr(killTarget) + PCBFlagsOffset); got != 8 {
 		t.Errorf("target flags %#x, want slot unmapped", got)
 	}
 	if f.m.registers[uptr] != run.uptr {
@@ -220,7 +220,7 @@ func TestKillCleanupParentless(t *testing.T) {
 	}
 	assertOrphaned(t, f, 2)
 	allowed := cleanupAllowed(killPages)
-	for _, a := range []uint32{pcbAddr(killTarget) + 72, pcbAddr(2), pcbAddr(2) + 8, pcbAddr(2) + 12} {
+	for _, a := range []uint32{pcbAddr(killTarget) + PCBFlagsOffset, pcbAddr(2), pcbAddr(2) + 8, pcbAddr(2) + 12} {
 		allowed[a] = true
 	}
 	assertOnlyChanged(t, f, run.before, allowed, nil)

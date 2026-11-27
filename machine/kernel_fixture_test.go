@@ -8,13 +8,11 @@ package machine
 // go test ./machine ./cross-assembler passed; fork.asm/fork_test.asm assembled
 // to 44/76 bytes. The latter compares child W9 to zero although specs.md says -2.
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +24,9 @@ const (
 	fixtureKPTR   = 0x1000000
 	fixtureUPTR   = 0x1100000
 	fixtureFrames = 0x1400000
+
+	// pteFrameMask selects the page-frame field below the valid bit.
+	pteFrameMask uint32 = isPteMappedMask - 1
 )
 
 type kernelFixture struct {
@@ -40,65 +41,22 @@ type kernelFixture struct {
 
 func newKernelFixture(t *testing.T) *kernelFixture {
 	t.Helper()
-	src, err := os.ReadFile("../sackOS/kernel.asm")
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, err := assembler.LoadAssemblyFromReader(strings.NewReader(string(src)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	image, err := assembler.ConvertInstructionsToBinary(parsed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := &kernelFixture{t: t, m: NewMachine(32<<20, false), labels: map[string]uint32{}, pages: map[uint32]uint32{}, next: fixtureFrames}
-	// Duplicate the assembler's documented line handling; independently verify
-	// every label operand against its resolved instruction displacement.
-	type reference struct {
-		ins, arg int
-		name     string
-	}
-	var refs []reference
-	s := bufio.NewScanner(strings.NewReader(string(src)))
-	n := 0
-	for s.Scan() {
-		line := strings.TrimSpace(strings.SplitN(s.Text(), ";", 2)[0])
-		if strings.HasSuffix(line, ":") {
-			name := strings.TrimSuffix(line, ":")
-			if _, ok := f.labels[name]; ok {
-				t.Fatalf("duplicate label %s", name)
-			}
-			f.labels[name] = uint32(n * 4)
-			continue
-		}
-		parts := strings.Fields(strings.ReplaceAll(line, ",", ""))
-		if len(parts) == 0 {
-			continue
-		}
-		for i, part := range parts[1:] {
-			refs = append(refs, reference{n, i + 1, part})
-		}
-		n++
-	}
-	if err := s.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if n != len(parsed) || len(image) != n*4 {
-		t.Fatal("assembler instruction count mismatch")
-	}
-	for _, r := range refs {
-		if target, ok := f.labels[r.name]; ok {
-			want := strconv.Itoa(int(target/4) - r.ins)
-			if parsed[r.ins][r.arg] != want {
-				t.Fatalf("label %s displacement: got %s want %s", r.name, parsed[r.ins][r.arg], want)
-			}
-		}
-	}
-	for off := uint32(0); off < uint32(len(image)); off += pageSize {
+	return newKernelFixtureBytes(t, 32<<20)
+}
+
+// newKernelFixtureBytes is the size-parameterised compact fixture. Stages 0-2
+// keep their 32 MiB backing; F2-07 stage 3 uses a larger compact backing while
+// still sharing scanASMKernel, the KPTR register relocation and the runner.
+func newKernelFixtureBytes(t *testing.T, memoryBytes int) *kernelFixture {
+	t.Helper()
+	// The shared scanner also verifies the instruction count and every label
+	// displacement against the assembler output.
+	k := loadASMKernel(t)
+	f := &kernelFixture{t: t, m: NewMachine(memoryBytes, false), labels: k.labels, pages: map[uint32]uint32{}, next: fixtureFrames}
+	for off := uint32(0); off < uint32(len(k.image)); off += pageSize {
 		f.mapKernel(off)
 	}
-	for i, b := range image {
+	for i, b := range k.image {
 		f.m.memory[f.phys(uint32(i))] = b
 	}
 	f.mapKernel(uint32(KernelGlobalsStart))         // globals and PCB 0
@@ -141,10 +99,35 @@ func (f *kernelFixture) initBitmap() {
 	f.bitmapReady = true
 }
 
-// Fork forms physical page-table addresses by subtracting the kernel boundary,
-// so those particular PCB pages must be identity backed, unlike other regions.
-// Only requested tables are mapped. The fixed compact layout supports PIDs
-// whose entire PCB fits below the compact KPTR; reject larger PIDs rather than alias.
+// identityPages makes each page reachable through KPTR at its own page index,
+// copying any previous backing so a remap does not hide visible bytes. Fork
+// forms physical page-table addresses by subtracting the kernel boundary, and
+// map_page/page_release reach their tables through the kernel window, so those
+// pages must be identity backed.
+func (f *kernelFixture) identityPages(pages ...uint32) {
+	f.t.Helper()
+	for _, page := range pages {
+		addr := page * pageSize
+		if int(addr)+pageSize > len(f.m.memory) {
+			f.t.Fatalf("identity page %#x beyond backing %#x", addr, len(f.m.memory))
+		}
+		if old, ok := f.pages[page]; ok && old == addr {
+			continue
+		}
+		if old, ok := f.pages[page]; ok {
+			copy(f.m.memory[addr:addr+pageSize], f.m.memory[old:old+pageSize])
+		}
+		f.pages[page] = addr
+		binary.LittleEndian.PutUint32(f.m.memory[fixtureKPTR+page*4:], isPteMappedMask|page)
+		if got, ok := f.m.lookupPhysical(kernelBoundary+addr, 4); !ok || got != addr {
+			f.t.Fatalf("identity mapping %#x got %#x mapped=%v", addr, got, ok)
+		}
+	}
+}
+
+// identityPCBPages identity maps every page of the requested PCB slots. The
+// fixed compact layout supports PIDs whose entire PCB fits below the compact
+// KPTR; reject larger PIDs rather than alias.
 func (f *kernelFixture) identityPCBPages(pids ...uint32) {
 	f.t.Helper()
 	for _, pid := range pids {
@@ -153,20 +136,11 @@ func (f *kernelFixture) identityPCBPages(pids ...uint32) {
 		if end > fixtureKPTR {
 			f.t.Fatalf("PID %d PCB end %#x overlaps compact KPTR %#x", pid, end, fixtureKPTR)
 		}
+		var pages []uint32
 		for addr := uint32(start) & ^uint32(pageSize-1); uint64(addr) < end; addr += pageSize {
-			page := addr / pageSize
-			if old, ok := f.pages[page]; ok && old == addr {
-				continue
-			}
-			if old, ok := f.pages[page]; ok {
-				copy(f.m.memory[addr:addr+pageSize], f.m.memory[old:old+pageSize])
-			}
-			f.pages[page] = addr
-			binary.LittleEndian.PutUint32(f.m.memory[fixtureKPTR+page*4:], isPteMappedMask|page)
-			if got, ok := f.m.lookupPhysical(kernelBoundary+addr, 4); !ok || got != addr {
-				f.t.Fatalf("PCB identity mapping %#x got %#x mapped=%v", addr, got, ok)
-			}
+			pages = append(pages, addr/pageSize)
 		}
+		f.identityPages(pages...)
 	}
 }
 
@@ -215,6 +189,28 @@ func (f *kernelFixture) get(addr uint32) uint32 {
 	return binary.LittleEndian.Uint32(f.m.memory[f.phys(addr):])
 }
 
+// runner returns a stepper over the fixture machine. The fixture's
+// translate-free diagnostic stays the single diagnostic implementation, and the
+// pre-step hook preserves the fixture's kernel and page-map checks. escaped is
+// the message used when the PC is below the kernel boundary.
+func (f *kernelFixture) runner(escaped string) *asmStepper {
+	f.t.Helper()
+	s := newASMStepper(f.t, f.m, f.labels)
+	s.diagnose = f.diagnostic
+	s.beforeStep = func(pcValue uint32) string {
+		if pcValue < kernelBoundary {
+			return escaped
+		}
+		if _, ok := f.pages[(pcValue-kernelBoundary)/pageSize]; !ok {
+			return "PC is unmapped"
+		}
+		return ""
+	}
+	return s
+}
+
+// run executes from one label to another, stopping before the until
+// instruction is fetched (label-reached semantics).
 func (f *kernelFixture) run(from, until string, limit int) {
 	f.t.Helper()
 	start, ok := f.labels[from]
@@ -227,36 +223,22 @@ func (f *kernelFixture) run(from, until string, limit int) {
 	}
 	f.phase = from
 	f.m.registers[pc] = kernelBoundary + start
-	for i := 0; i < limit; i++ {
-		current := f.m.registers[pc]
-		if current == kernelBoundary+end {
-			return
-		}
-		if current < kernelBoundary {
-			f.fail("PC escaped kernel")
-		}
-		if _, ok := f.pages[(current-kernelBoundary)/pageSize]; !ok {
-			f.fail("PC is unmapped")
-		}
-		if !f.m.fetch() {
-			f.fail("fetch fault")
-		}
-		inst, ok := f.m.decode()
-		if !ok {
-			f.fail("decode fault")
-		}
-		if f.m.checkIllegalRegisterAccess(inst) || f.m.checkIllegalInstruction(inst) {
-			f.fail("illegal instruction or register access")
-		}
-		f.m.execute(inst)
+	if start == end {
+		return
+	}
+	s := f.runner("PC escaped kernel")
+	s.onStep = append(s.onStep, func(Instruction, uint32) {
 		if f.m.registers[pc] < kernelBoundary {
 			f.fail("exception or PC escaped kernel")
 		}
-	}
-	f.fail(fmt.Sprintf("step budget %d exhausted", limit))
+	})
+	s.run(from, limit, func(Instruction, uint32) bool {
+		return f.m.registers[pc] == kernelBoundary+end
+	})
 }
 
-// Continue through the actual scheduler MRET, not merely its entry label.
+// runToMRET executes through the actual scheduler MRET, not merely its entry
+// label (MRET-executed semantics).
 func (f *kernelFixture) runToMRET(from string, limit int) {
 	f.t.Helper()
 	start, ok := f.labels[from]
@@ -265,32 +247,23 @@ func (f *kernelFixture) runToMRET(from string, limit int) {
 	}
 	f.phase = from + "->MRET"
 	f.m.registers[pc] = kernelBoundary + start
-	for i := 0; i < limit; i++ {
-		current := f.m.registers[pc]
-		if current < kernelBoundary {
-			f.fail("escaped kernel before MRET")
-		}
-		if _, ok := f.pages[(current-kernelBoundary)/pageSize]; !ok {
-			f.fail("PC is unmapped")
-		}
-		if !f.m.fetch() {
-			f.fail("fetch fault")
-		}
-		inst, ok := f.m.decode()
-		if !ok || f.m.checkIllegalRegisterAccess(inst) || f.m.checkIllegalInstruction(inst) {
-			f.fail("decode or access fault")
-		}
-		f.m.execute(inst)
-		if inst.opcode == MRET {
-			return
-		}
-	}
-	f.fail(fmt.Sprintf("MRET step budget %d exhausted", limit))
+	s := f.runner("escaped kernel before MRET")
+	s.runBudget(f.phase, limit, "MRET step budget", func(inst Instruction, _ uint32) bool {
+		return inst.opcode == MRET
+	})
 }
 
 func (f *kernelFixture) fail(reason string) {
 	f.t.Helper()
 	f.t.Fatal(f.diagnostic(reason))
+}
+
+// diagnosticText is the in-process, return-only variant of fail for future
+// relocation tests, which need the text without ending the test. The subprocess
+// budget test above remains the proof that a real failure prints it.
+func (f *kernelFixture) diagnosticText(reason string) string {
+	f.t.Helper()
+	return f.diagnostic(reason)
 }
 
 // Diagnostics must not fault again when the CPU or page tables are corrupt.
@@ -338,7 +311,7 @@ func (f *kernelFixture) diagnostic(reason string) string {
 		if !ok || pte&isPteMappedMask == 0 {
 			return 0, false
 		}
-		return physicalWord(uint64(pte&0xfffff)*pageSize + addr%pageSize)
+		return physicalWord(uint64(pte&pteFrameMask)*pageSize + addr%pageSize)
 	}
 	formatWord := func(value uint32, ok bool) string {
 		if !ok {
@@ -353,16 +326,16 @@ func (f *kernelFixture) diagnostic(reason string) string {
 		pidText = fmt.Sprint(pid)
 		if pid < 256 {
 			base := uint64(PCBVectorStart) + uint64(pid)*uint64(PCBStride)
-			mapping, mappingOK := kernelPTE(base + 56)
+			mapping, mappingOK := kernelPTE(base + uint64(PCBW9Offset))
 			mappingText = formatWord(mapping, mappingOK)
-			value, ok := kernelWord(base + 56)
+			value, ok := kernelWord(base + uint64(PCBW9Offset))
 			w9Text = formatWord(value, ok)
-			value, ok = kernelWord(base + 76)
+			value, ok = kernelWord(base + uint64(PCBPagesUsedOffset))
 			pagesText = formatWord(value, ok)
-			pte, ok := kernelWord(base + 80)
+			pte, ok := kernelWord(base + uint64(PCBPageTableOffset))
 			pteText = formatWord(pte, ok)
 			if ok && pte&isPteMappedMask != 0 {
-				frame := pte & 0xfffff
+				frame := pte & pteFrameMask
 				bitmap, mapped := kernelWord(uint64(BitmapStart) + uint64(frame/32)*4)
 				if mapped {
 					bitmapText = fmt.Sprintf("frame=%d word=%#x bit=%d", frame, bitmap, (bitmap>>(frame%32))&1)
@@ -379,9 +352,9 @@ func TestKernelFixtureBudgetDiagnostic(t *testing.T) {
 		f := newKernelFixture(t)
 		pcb := uint32(PCBVectorStart) + PCBStride
 		f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 1)
-		f.put(pcb+56, 0x12345678)
-		f.put(pcb+76, 7)
-		f.put(pcb+80, isPteMappedMask|1)
+		f.put(pcb+PCBW9Offset, 0x12345678)
+		f.put(pcb+PCBPagesUsedOffset, 7)
+		f.put(pcb+PCBPageTableOffset, isPteMappedMask|1)
 		f.run("loop", "schedule", 3)
 		return
 	}
@@ -423,9 +396,9 @@ func TestKernelFixtureDiagnosticUnavailable(t *testing.T) {
 	}
 	pcb := uint32(PCBVectorStart) + PCBStride
 	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 1)
-	f.put(pcb+56, 0x12345678)
-	f.put(pcb+76, 7)
-	f.put(pcb+80, isPteMappedMask|1)
+	f.put(pcb+PCBW9Offset, 0x12345678)
+	f.put(pcb+PCBPagesUsedOffset, 7)
+	f.put(pcb+PCBPageTableOffset, isPteMappedMask|1)
 	pteAddr := fixtureKPTR + (pcb/pageSize)*4
 	if _, ok := f.pages[pcb/pageSize]; !ok {
 		t.Fatal("expected PCB backing")
@@ -446,14 +419,14 @@ func TestKernelFixtureDiagnosticUnavailable(t *testing.T) {
 func TestKernelFixtureHandlerAndIsolation(t *testing.T) {
 	a, b := newKernelFixture(t), newKernelFixture(t)
 	a.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
-	a.put(uint32(PCBVectorStart)+56, 0x12345678)
-	b.put(uint32(PCBVectorStart)+56, 0x87654321)
+	a.put(uint32(PCBVectorStart)+PCBW9Offset, 0x12345678)
+	b.put(uint32(PCBVectorStart)+PCBW9Offset, 0x87654321)
 	a.m.registers[w9] = 3 // real syscall dispatcher -> getPID -> schedule
 	a.run("syscall_int", "schedule", 200)
-	if got := a.get(uint32(PCBVectorStart) + 56); got != 0 {
+	if got := a.get(uint32(PCBVectorStart) + PCBW9Offset); got != 0 {
 		t.Fatalf("getPID result %#x", got)
 	}
-	if got := b.get(uint32(PCBVectorStart) + 56); got != 0x87654321 {
+	if got := b.get(uint32(PCBVectorStart) + PCBW9Offset); got != 0x87654321 {
 		t.Fatalf("fixture leaked PCB state: %#x", got)
 	}
 	for page, frame := range a.pages {
@@ -469,9 +442,9 @@ func TestKernelFixtureForkNoSlots(t *testing.T) {
 	f := newKernelFixture(t)
 	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 1)
 	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
-	f.put(uint32(PCBVectorStart)+72, 1)
+	f.put(uint32(PCBVectorStart)+PCBFlagsOffset, 1)
 	f.run("fork", "schedule", 300)
-	if got := f.get(uint32(PCBVectorStart) + 56); got != ^uint32(0) {
+	if got := f.get(uint32(PCBVectorStart) + PCBW9Offset); got != ^uint32(0) {
 		t.Fatalf("fork no-slot result = %#x, want -1", got)
 	}
 }
@@ -481,12 +454,12 @@ func TestKernelFixturePID2Handler(t *testing.T) {
 	f.identityPCBPages(0, 2)
 	other := uint32(PCBVectorStart) + 2*PCBStride
 	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 2)
-	f.put(uint32(PCBVectorStart)+56, 0xabcdef01)
-	f.put(other+56, 0x12345678)
+	f.put(uint32(PCBVectorStart)+PCBW9Offset, 0xabcdef01)
+	f.put(other+PCBW9Offset, 0x12345678)
 	f.m.registers[w9] = 3
 	f.run("syscall_int", "schedule", 200)
-	if f.get(other+56) != 2 || f.get(uint32(PCBVectorStart)+56) != 0xabcdef01 {
-		t.Fatalf("PID 2 getPID changed wrong PCB: pid2=%#x pid0=%#x", f.get(other+56), f.get(uint32(PCBVectorStart)+56))
+	if f.get(other+PCBW9Offset) != 2 || f.get(uint32(PCBVectorStart)+PCBW9Offset) != 0xabcdef01 {
+		t.Fatalf("PID 2 getPID changed wrong PCB: pid2=%#x pid0=%#x", f.get(other+PCBW9Offset), f.get(uint32(PCBVectorStart)+PCBW9Offset))
 	}
 	if f.phys(other)&^(pageSize-1) == f.phys(uint32(PCBVectorStart))&^(pageSize-1) {
 		t.Fatal("PID 0 and PID 2 PCB pages share a frame")
@@ -498,11 +471,11 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	f.identityPCBPages(0, 1, 2)
 	parent := uint32(PCBVectorStart)
 	child := uint32(PCBVectorStart) + PCBStride
-	parentPT, childPT := parent+80, child+80
+	parentPT, childPT := parent+PCBPageTableOffset, child+PCBPageTableOffset
 	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 2)
 	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
 	f.put(parent+4, ^uint32(0))
-	f.put(parent+72, 1)
+	f.put(parent+PCBFlagsOffset, 1)
 	for off := uint32(20); off <= 68; off += 4 {
 		f.put(parent+off, 0x1000+off)
 	}
@@ -523,10 +496,10 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	f.next += pageSize
 	otherPCB := uint32(PCBVectorStart) + 2*PCBStride
 	f.put(otherPCB+20, 0x12345678)
-	f.put(otherPCB+56, 0x87654321)
-	f.put(otherPCB+72, 9)
-	f.put(otherPCB+76, 1)
-	f.put(otherPCB+80, isPteMappedMask|otherFrame/pageSize)
+	f.put(otherPCB+PCBW9Offset, 0x87654321)
+	f.put(otherPCB+PCBFlagsOffset, 9)
+	f.put(otherPCB+PCBPagesUsedOffset, 1)
+	f.put(otherPCB+PCBPageTableOffset, isPteMappedMask|otherFrame/pageSize)
 	for i := uint32(0); i < pageSize; i++ {
 		f.m.memory[otherFrame+i] = byte(i*37 + 11)
 	}
@@ -537,7 +510,7 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	}
 	copy(f.m.memory[parentFrame:parentFrame+pageSize], sample)
 	f.put(parentPT, isPteMappedMask|parentFrame/pageSize)
-	f.put(parent+76, 1)
+	f.put(parent+PCBPagesUsedOffset, 1)
 	f.initBitmap()
 	allocated := f.next
 	bitmapWord := uint32(BitmapStart) + (allocated/pageSize/32)*4
@@ -553,16 +526,16 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	}
 	// Full 786432-entry scan and one real map_page/copy: no loop shortcut.
 	f.run("fork", "schedule", 20000000)
-	if f.get(parent+56) != 1 || f.get(child+56) != ^uint32(1) {
-		t.Fatalf("fork returns parent=%#x child=%#x", f.get(parent+56), f.get(child+56))
+	if f.get(parent+PCBW9Offset) != 1 || f.get(child+PCBW9Offset) != ^uint32(1) {
+		t.Fatalf("fork returns parent=%#x child=%#x", f.get(parent+PCBW9Offset), f.get(child+PCBW9Offset))
 	}
 	for off := uint32(20); off <= 68; off += 4 {
-		if off != 56 && f.get(child+off) != f.get(parent+off) {
+		if off != PCBW9Offset && f.get(child+off) != f.get(parent+off) {
 			t.Fatalf("context offset %d parent=%#x child=%#x", off, f.get(parent+off), f.get(child+off))
 		}
 	}
-	if f.get(parent+4) != 1 || f.get(child) != 0 || f.get(child+72)&1 == 0 || f.get(child+76) != 1 {
-		t.Fatalf("fork PCB links/flags/pages parent.child=%d child.parent=%d flags=%#x pages=%d", f.get(parent+4), f.get(child), f.get(child+72), f.get(child+76))
+	if f.get(parent+4) != 1 || f.get(child) != 0 || f.get(child+PCBFlagsOffset)&1 == 0 || f.get(child+PCBPagesUsedOffset) != 1 {
+		t.Fatalf("fork PCB links/flags/pages parent.child=%d child.parent=%d flags=%#x pages=%d", f.get(parent+4), f.get(child), f.get(child+PCBFlagsOffset), f.get(child+PCBPagesUsedOffset))
 	}
 	pte := f.get(childPT)
 	if pte != isPteMappedMask|allocated/pageSize || f.get(bitmapWord)&bit == 0 {
@@ -589,9 +562,48 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	if string(otherHeader) != string(f.m.memory[f.phys(otherPCB):f.phys(otherPCB)+84]) || string(otherSnapshot) != string(f.m.memory[otherFrame:otherFrame+pageSize]) {
 		t.Fatal("fork/scheduler changed unrelated PID 2 PCB or frame")
 	}
-	// Branch probes resume the real MRET context, but do not execute the
-	// samples' wait/exit syscalls end-to-end. fork_test expects zero and falls
-	// into the parent path with the actual -2 child result.
+}
+
+// Branch probes resume the real MRET context, but do not execute the samples'
+// wait/exit syscalls end-to-end. fork_test expects zero and falls into the
+// parent path with the actual -2 child result, while fork.asm expects -2.
+func TestKernelFixtureForkSampleBranchDiscrepancy(t *testing.T) {
+	f := newKernelFixture(t)
+	f.identityPCBPages(0, 1)
+	parent := uint32(PCBVectorStart)
+	child := parent + PCBStride
+	parentPT := parent + PCBPageTableOffset
+	f.put(uint32(GlobalAddress(GlobalMaxProcessesOffset)), 2)
+	f.put(uint32(GlobalAddress(GlobalRunningPIDOffset)), 0)
+	f.put(parent+4, ^uint32(0))
+	f.put(parent+PCBFlagsOffset, 1)
+	for off := uint32(20); off <= 68; off += 4 {
+		f.put(parent+off, 0x1000+off)
+	}
+	f.put(parent+60, 8)
+	f.put(parent+64, 0x3ff0)
+	f.put(parent+68, 32|8)
+	sample, err := assembler.RunAssembler("../asm/samples/fork_test.asm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sample) != 76 {
+		t.Fatalf("fork_test sample length %d, baseline 76", len(sample))
+	}
+	parentFrame := f.next
+	f.next += pageSize
+	copy(f.m.memory[parentFrame:parentFrame+pageSize], sample)
+	f.put(parentPT, isPteMappedMask|parentFrame/pageSize)
+	f.put(parent+PCBPagesUsedOffset, 1)
+	f.initBitmap()
+	f.run("fork", "schedule", 20000000)
+	if f.get(parent+PCBW9Offset) != 1 || f.get(child+PCBW9Offset) != ^uint32(1) {
+		t.Fatalf("fork returns parent=%#x child=%#x", f.get(parent+PCBW9Offset), f.get(child+PCBW9Offset))
+	}
+	f.runToMRET("schedule", 500)
+	if f.m.registers[pc] != 8 {
+		t.Fatalf("child resumed at PC=%#x, want 8", f.m.registers[pc])
+	}
 	for i := 0; i < 3; i++ {
 		if !f.m.fetch() {
 			t.Fatal("sample fetch fault")
@@ -613,6 +625,11 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 	if len(other) != 44 {
 		t.Fatalf("fork sample length %d, baseline 44", len(other))
 	}
+	childPTE := f.get(child + PCBPageTableOffset)
+	if childPTE&isPteMappedMask == 0 {
+		t.Fatalf("child page table entry %#x is not mapped", childPTE)
+	}
+	allocated := (childPTE & pteFrameMask) * pageSize
 	copy(f.m.memory[allocated:], other)
 	f.m.registers[pc] = 0
 	for i := 0; i < 4; i++ {
@@ -626,7 +643,7 @@ func TestKernelFixtureForkSuccessAndSampleDiscrepancy(t *testing.T) {
 		f.m.execute(inst)
 	}
 	f.m.registers[pc] = 20 // resume after syscall, with the real child result
-	f.m.registers[w9] = f.get(child + 56)
+	f.m.registers[w9] = f.get(child + PCBW9Offset)
 	for i := 0; i < 2; i++ {
 		if !f.m.fetch() {
 			t.Fatal("fork sample fetch fault")

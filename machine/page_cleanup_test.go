@@ -219,11 +219,11 @@ func TestPageCleanupCountReachesZeroOnEitherSide(t *testing.T) {
 	}
 }
 
-// A09: flags and padding hold sentinels distinct from the count at +76.
+// A09: flags and padding hold sentinels distinct from the count at PCBPagesUsedOffset.
 func TestPageCleanupFlagsPaddingAndCount(t *testing.T) {
 	t.Parallel()
 	f := newCleanupFixture(t)
-	flags := pcbAddr(cleanupPID) + 72
+	flags := pcbAddr(cleanupPID) + PCBFlagsOffset
 	f.put(flags, 0x5A5A5AA5)
 	pages := []userPage{{0, 0x40300}, {0xBFFFF, 0x40301}}
 	installPages(f, pages)
@@ -403,7 +403,7 @@ func TestPageCleanupCountMismatch(t *testing.T) {
 	}
 }
 
-// R2: W7 must be an exact PCB base below max_processes and W6 = W7 + 80.
+// R2: W7 must be an exact PCB base below max_processes and W6 = W7 + PCBPageTableOffset.
 func TestPageCleanupInvalidPointers(t *testing.T) {
 	t.Parallel()
 	pcb := kernelBoundary + pcbAddr(cleanupPID)
@@ -411,10 +411,10 @@ func TestPageCleanupInvalidPointers(t *testing.T) {
 		name           string
 		pcbVA, tableVA uint32
 	}{
-		{"below the PCB vector", kernelBoundary + uint32(PCBVectorStart) - 4, kernelBoundary + uint32(PCBVectorStart) + 76},
+		{"below the PCB vector", kernelBoundary + uint32(PCBVectorStart) - 4, kernelBoundary + uint32(PCBVectorStart) + PCBPagesUsedOffset},
 		{"inside a PCB", pcb + 4, pcb + 84},
 		{"slot beyond max_processes", kernelBoundary + pcbAddr(4), kernelBoundary + pcbAddr(4) + pcbTableOffset},
-		{"table not at PCB + 80", pcb, pcb + 84},
+		{"table not at PCB + PCBPageTableOffset", pcb, pcb + 84},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -434,13 +434,13 @@ func TestPageCleanupConnectedProcess(t *testing.T) {
 		mapPCBHeader(f, pid)
 	}
 	pcb := pcbAddr(cleanupPID)
-	f.put(pcb, 0)             // parent
-	f.put(pcb+4, 3)           // child
-	f.put(pcb+8, 2)           // previous sibling
-	f.put(pcb+12, ^uint32(0)) // next sibling
-	f.put(pcb+16, 0x1008)     // status address
-	f.put(pcb+72, 9)          // mapped, ready
-	f.put(pcbAddr(0)+72, 5)   // parent mapped and waiting
+	f.put(pcb, 0)                       // parent
+	f.put(pcb+4, 3)                     // child
+	f.put(pcb+8, 2)                     // previous sibling
+	f.put(pcb+12, ^uint32(0))           // next sibling
+	f.put(pcb+16, 0x1008)               // status address
+	f.put(pcb+PCBFlagsOffset, 9)        // mapped, ready
+	f.put(pcbAddr(0)+PCBFlagsOffset, 5) // parent mapped and waiting
 	f.put(pcbAddr(0)+4, 2)
 	f.put(pcbAddr(2)+12, cleanupPID)
 	f.put(pcbAddr(3), cleanupPID)

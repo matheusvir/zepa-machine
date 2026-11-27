@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -27,7 +28,17 @@ type asmKernel struct {
 
 func loadASMKernel(t *testing.T) asmKernel {
 	t.Helper()
-	src, err := os.ReadFile(asmLayoutKernelPath)
+	return scanASMKernel(t, asmLayoutKernelPath)
+}
+
+// scanASMKernel builds the label map and image with the assembler's line rules:
+// text after ';' is dropped, a line ending in ':' is a label, commas are
+// removed, and every other non-empty line is one instruction. It cross-checks
+// the line count and every label operand against the assembler output, and
+// locates setup's first JMPR.
+func scanASMKernel(t *testing.T, path string) asmKernel {
+	t.Helper()
+	src, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,13 +50,22 @@ func loadASMKernel(t *testing.T) asmKernel {
 	if err != nil {
 		t.Fatal(err)
 	}
+	type reference struct {
+		ins, arg int
+		name     string
+	}
+	var refs []reference
 	k := asmKernel{image: image, labels: map[string]uint32{}, highJump: ^uint32(0)}
 	s := bufio.NewScanner(strings.NewReader(string(src)))
-	n := uint32(0)
+	n := 0
 	for s.Scan() {
-		line := strings.TrimSpace(strings.SplitN(strings.TrimSpace(s.Text()), ";", 2)[0])
+		line := strings.TrimSpace(strings.SplitN(s.Text(), ";", 2)[0])
 		if strings.HasSuffix(line, ":") {
-			k.labels[strings.TrimSuffix(line, ":")] = n * 4
+			name := strings.TrimSuffix(line, ":")
+			if _, ok := k.labels[name]; ok {
+				t.Fatalf("duplicate label %s", name)
+			}
+			k.labels[name] = uint32(n * 4)
 			continue
 		}
 		fields := strings.Fields(strings.ReplaceAll(line, ",", ""))
@@ -53,18 +73,29 @@ func loadASMKernel(t *testing.T) asmKernel {
 			continue
 		}
 		if k.highJump == ^uint32(0) && strings.EqualFold(fields[0], "JMPR") {
-			k.highJump = n * 4
+			k.highJump = uint32(n * 4)
+		}
+		for i, part := range fields[1:] {
+			refs = append(refs, reference{n, i + 1, part})
 		}
 		n++
 	}
 	if err := s.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if int(n) != len(parsed) || len(image) != int(n)*4 {
+	if n != len(parsed) || len(image) != n*4 {
 		t.Fatalf("label map counted %d instructions, assembler produced %d (%d bytes)", n, len(parsed), len(image))
 	}
 	if k.highJump == ^uint32(0) {
 		t.Fatal("setup high jump (JMPR) not found")
+	}
+	for _, r := range refs {
+		if target, ok := k.labels[r.name]; ok {
+			want := strconv.Itoa(int(target/4) - r.ins)
+			if parsed[r.ins][r.arg] != want {
+				t.Fatalf("label %s displacement: got %s want %s", r.name, parsed[r.ins][r.arg], want)
+			}
+		}
 	}
 	return k
 }
@@ -96,14 +127,16 @@ type asmAccessEvent struct {
 // and checks, before execution, that every fetch and data access translates to
 // a physical address inside the backing.
 type asmStepper struct {
-	t       *testing.T
-	m       *Machine
-	labels  map[string]uint32
-	phase   string
-	steps   int
-	onStore []func(asmAccessEvent)
-	onLoad  []func(asmAccessEvent)
-	onStep  []func(inst Instruction, pcBefore uint32)
+	t          *testing.T
+	m          *Machine
+	labels     map[string]uint32
+	phase      string
+	steps      int
+	diagnose   func(reason string) string // overrides diagnostic, e.g. for the fixture
+	beforeStep func(pc uint32) string     // optional pre-fetch check
+	onStore    []func(asmAccessEvent)
+	onLoad     []func(asmAccessEvent)
+	onStep     []func(inst Instruction, pcBefore uint32)
 }
 
 func newASMStepper(t *testing.T, m *Machine, labels map[string]uint32) *asmStepper {
@@ -149,6 +182,11 @@ func (s *asmStepper) step() (Instruction, uint32) {
 	s.t.Helper()
 	m := s.m
 	pcBefore := m.registers[pc]
+	if s.beforeStep != nil {
+		if problem := s.beforeStep(pcBefore); problem != "" {
+			s.fail(problem)
+		}
+	}
 	if _, problem := s.physical(pcBefore, 4); problem != "" {
 		s.fail("fetch: " + problem)
 	}
@@ -202,6 +240,14 @@ func (s *asmStepper) step() (Instruction, uint32) {
 
 // run steps until done reports true for an executed instruction.
 func (s *asmStepper) run(phase string, budget int, done func(inst Instruction, pcBefore uint32) bool) {
+	s.runBudget(phase, budget, "step budget", done)
+}
+
+// runBudget is the single predicate runner. done receives each executed
+// instruction and the PC it was fetched from; it decides whether to stop. The
+// budget diagnostic is caller-selectable so label-reached and MRET-executed
+// runs keep their distinct messages.
+func (s *asmStepper) runBudget(phase string, budget int, budgetPrefix string, done func(inst Instruction, pcBefore uint32) bool) {
 	s.t.Helper()
 	s.phase = phase
 	defer func() {
@@ -214,7 +260,7 @@ func (s *asmStepper) run(phase string, budget int, done func(inst Instruction, p
 			return
 		}
 	}
-	s.fail(fmt.Sprintf("step budget %d exhausted", budget))
+	s.fail(fmt.Sprintf("%s %d exhausted", budgetPrefix, budget))
 }
 
 func (s *asmStepper) fail(reason string) {
@@ -223,17 +269,22 @@ func (s *asmStepper) fail(reason string) {
 }
 
 func (s *asmStepper) diagnostic(reason string) string {
+	if s.diagnose != nil {
+		return s.diagnose(reason)
+	}
 	r := s.m.registers
 	return fmt.Sprintf("%s: phase=%s step=%d PC=%#x label=%s SR=%#x SP=%#x KPTR=%#x UPTR=%#x ECR=%d EFA=%#x W0=%#x W1=%#x W9=%#x",
-		reason, s.phase, s.steps, r[pc], s.nearestLabel(r[pc]), r[sr], r[sp], r[kptr], r[uptr], r[ecr], r[efa], r[w0], r[w1], r[w9])
+		reason, s.phase, s.steps, r[pc], nearestLabel(s.labels, r[pc]), r[sr], r[sp], r[kptr], r[uptr], r[ecr], r[efa], r[w0], r[w1], r[w9])
 }
 
-func (s *asmStepper) nearestLabel(addr uint32) string {
+// nearestLabel names the closest label at or before addr. Addresses at or above
+// the kernel boundary are treated as kernel-virtual offsets.
+func nearestLabel(labels map[string]uint32, addr uint32) string {
 	if addr >= kernelBoundary {
 		addr -= kernelBoundary
 	}
 	best, name := uint32(0), ""
-	for label, off := range s.labels {
+	for label, off := range labels {
 		if off <= addr && (name == "" || off > best || (off == best && label < name)) {
 			best, name = off, label
 		}
@@ -519,10 +570,10 @@ func TestKernelASMLayoutProcessLifecycle(t *testing.T) {
 		t.Fatalf("running_pid %d after input, want 0", got)
 	}
 	pte := physWord(m, pcb0+PCBPageTableOffset)
-	if pte&isPteMappedMask == 0 || pte&0xFFFFF < asmKernelFrames {
+	if pte&isPteMappedMask == 0 || pte&pteFrameMask < asmKernelFrames {
 		t.Fatalf("process PTE 0 = %#x, want a valid frame >= %#x", pte, asmKernelFrames)
 	}
-	frame := pte & 0xFFFFF
+	frame := pte & pteFrameMask
 	if frame != firstFrame || physWord(m, bitWord)&1 == 0 {
 		t.Fatalf("frame %#x, bitmap word %#x = %#x; want frame %#x with bit 0 set", frame, bitWord, physWord(m, bitWord), firstFrame)
 	}
